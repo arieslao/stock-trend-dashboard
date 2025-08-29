@@ -7,7 +7,6 @@ import plotly.express as px
 import yfinance as yf
 import gspread, json
 
-
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
 st.title("📈 AI-Powered Stock Trend Dashboard")
@@ -46,7 +45,10 @@ def get_candles(symbol: str, days: int = 180, resolution="D"):
         r.raise_for_status()
         data = r.json()
         if data.get("s") == "ok":
-            df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
+            df = pd.DataFrame({
+                "t": data["t"], "o": data["o"], "h": data["h"],
+                "l": data["l"], "c": data["c"], "v": data["v"]
+            })
             df["time"] = pd.to_datetime(df["t"], unit="s")
             df.rename(columns={"c": "close"}, inplace=True)
             df.set_index("time", inplace=True)
@@ -56,17 +58,17 @@ def get_candles(symbol: str, days: int = 180, resolution="D"):
             raise RuntimeError(f"Finnhub candles status: {data.get('s')}")
     except Exception as e:
         # --- Fallback: Yahoo Finance
-        # Map daily to 1d; intraday could map resolution '60' -> interval='60m'
         interval = "1d" if resolution == "D" else "60m"
-        period_days = min(max(days, 5), 365*2)  # safety bounds
+        period_days = min(max(days, 5), 365 * 2)  # safety bounds
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period=f"{period_days}d", interval=interval)
         if hist.empty:
             raise RuntimeError(f"Yahoo Finance returned no data for {symbol}") from e
-        df = hist.rename(columns={"Close": "close", "Open":"o", "High":"h", "Low":"l", "Volume":"v"})
+        df = hist.rename(columns={
+            "Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"
+        })
         df.index.name = "time"
-        return df[["o","h","l","close","v"]]
-
+        return df[["o", "h", "l", "close", "v"]]
 
 def featurize(df: pd.DataFrame):
     out = df.copy()
@@ -83,12 +85,11 @@ def fit_and_predict(df_features: pd.DataFrame):
     next_price = float(model.predict(last)[0])
     return model, next_price
 
-
+# ---------- Google Sheets logging ----------
 @st.cache_resource
 def get_ws():
     """Connect to the 'predictions' worksheet in your Google Sheet, creating it if needed."""
     sa_info = st.secrets["gsheets"]["service_account"]
-    # secrets["gsheets"]["service_account"] comes in as a JSON string
     if isinstance(sa_info, str):
         sa_info = json.loads(sa_info)
     client = gspread.service_account_from_dict(sa_info)
@@ -98,9 +99,9 @@ def get_ws():
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title="predictions", rows=1000, cols=30)
         ws.append_row([
-            "timestamp_utc","symbol","horizon","last_close","predicted",
-            "model_kind","params_json","train_window","features",
-            "actual","err","pct_err","direction_correct"
+            "timestamp_utc", "symbol", "horizon", "last_close", "predicted",
+            "model_kind", "params_json", "train_window", "features",
+            "actual", "err", "pct_err", "direction_correct"
         ])
     return ws
 
@@ -114,10 +115,7 @@ def log_prediction(symbol, last_close, predicted, model_kind, params, train_wind
         "", "", "", ""  # placeholders for actual/error filled in later
     ])
 
-
-
-
-# ---------- Sidebar / Controls ----------
+# ---------- Sidebar / Controls (define BEFORE predictions) ----------
 default_watchlist = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 with st.sidebar:
     st.header("Controls")
@@ -126,6 +124,13 @@ with st.sidebar:
     alert_pct = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.5)
     symbol = st.selectbox("Focus symbol", watchlist or default_watchlist)
     st.markdown("**Note:** Free Finnhub keys allow ~60 requests/min.")
+
+    st.divider()
+    st.subheader("Model")
+    # For now, we keep the simple Linear model, but we still expose these for logging & future upgrades
+    model_kind = st.selectbox("Choose model", ["Linear"])  # placeholder for future: Ridge/RandomForest/GB
+    params = {}
+    train_window = st.slider("Training window (days)", 60, 300, 120, 10)
 
 # ---------- Focus symbol KPIs ----------
 try:
@@ -137,7 +142,7 @@ except Exception as e:
     st.stop()
 
 # ---------- Chart + Forecast ----------
-col1, col2 = st.columns([3,1])
+col1, col2 = st.columns([3, 1])
 with col1:
     try:
         df = get_candles(symbol, days=days, resolution="D")
@@ -149,35 +154,35 @@ with col1:
         line.add_scatter(x=feat.index, y=feat["MA10"], mode="lines", name="MA10")
         line.add_scatter(x=feat.index, y=feat["MA50"], mode="lines", name="MA50")
         st.plotly_chart(line, use_container_width=True)
+
+        # --- log the prediction for learning (only if prediction succeeded) ---
+        features_desc = "MA10,MA50"
+        log_prediction(
+            symbol=symbol,
+            last_close=float(df["close"].iloc[-1]),
+            predicted=float(next_price),
+            model_kind=model_kind,
+            params=params,
+            train_window=train_window,
+            features_desc=features_desc
+        )
+
     except Exception as e:
         st.error(f"History/forecast error: {e}")
 
 with col2:
-    st.metric("Predicted next close", f"{next_price:,.2f}" if 'next_price' in locals() else "—",
-              f"{pct_change:+.2f}% vs last" if 'pct_change' in locals() else None)
-    if 'pct_change' in locals():
+    st.metric(
+        "Predicted next close",
+        f"{next_price:,.2f}" if "next_price" in locals() else "—",
+        f"{pct_change:+.2f}% vs last" if "pct_change" in locals() else None
+    )
+    if "pct_change" in locals():
         if pct_change >= alert_pct:
             st.success(f"Potential BUY momentum (>{alert_pct}% ↑).")
         elif pct_change <= -alert_pct:
             st.error(f"Potential SELL momentum / caution (<-{alert_pct}% ↓).")
         else:
             st.info("No strong signal at your threshold.")
-
-# --- log the prediction for learning ---
-features_desc = "MA10,MA50,ret_1,ret_5,vol_10,ma_cross"  # or however you define features
-log_prediction(
-    symbol=symbol,
-    last_close=float(df["close"].iloc[-1]),
-    predicted=float(next_price),
-    model_kind=model_kind,
-    params=params,
-    train_window=train_window,
-    features_desc=features_desc
-)
-
-
-
-
 
 # ---------- Watchlist Table ----------
 rows = []
@@ -190,7 +195,7 @@ for s in watchlist:
         _, nxt = fit_and_predict(f)
         ret = 100.0 * (nxt - d["close"].iloc[-1]) / d["close"].iloc[-1]
         signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
-        rows.append({"Symbol": s, "Last": round(p,2), "Predicted": round(nxt,2), "Δ%": round(ret,2), "Signal": signal})
+        rows.append({"Symbol": s, "Last": round(p, 2), "Predicted": round(nxt, 2), "Δ%": round(ret, 2), "Signal": signal})
     except Exception:
         rows.append({"Symbol": s, "Last": None, "Predicted": None, "Δ%": None, "Signal": "ERR"})
 
