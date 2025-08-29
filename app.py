@@ -147,9 +147,18 @@ with st.sidebar:
     params      = {}
     train_window= st.slider("Training window (days)", 60, 300, 120, 10)
 
+
 # ---------- Diagnostics (test Sheets connection) ----------
 with st.expander("🔧 Diagnostics"):
     st.write("Google Sheet ID:", st.secrets.get("gsheets", {}).get("sheet_id", "(missing)"))
+
+    # 👇 Add THESE lines to see how Streamlit parsed your service account
+    sa_obj = st.secrets.get("gsheets", {}).get("service_account", None)
+    st.write("Service account format detected:", type(sa_obj).__name__)
+    if isinstance(sa_obj, dict):
+        # Show which keys exist (but not the private key contents)
+        st.write("Service account keys:", [k for k in sa_obj.keys() if k != "private_key"])
+
     if st.button("Test write to Google Sheet"):
         try:
             log_prediction(
@@ -164,6 +173,7 @@ with st.expander("🔧 Diagnostics"):
             st.success("✅ Test row written to the 'predictions' worksheet. Check your Sheet.")
         except Exception as e:
             st.error(f"❌ Failed to write: {e}")
+
 
 # ---------- Live KPI ----------
 try:
