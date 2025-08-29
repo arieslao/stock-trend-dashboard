@@ -1,5 +1,6 @@
 import os, time, requests, json
 from datetime import datetime, timedelta
+from collections.abc import Mapping
 
 import pandas as pd
 import numpy as np
@@ -93,19 +94,24 @@ def fit_and_predict(df_features: pd.DataFrame):
 def get_ws():
     """
     Connect to the 'predictions' worksheet (create if needed).
-    Robust to Secrets formatting: accepts TOML table (dict) OR JSON string
-    and auto-escapes private_key newlines if pasted wrong.
+    Robust to Secrets formatting:
+      - TOML table → AttrDict/Mapping
+      - Plain dict
+      - JSON string (with or without \n)
     """
     sa_raw = st.secrets["gsheets"]["service_account"]
 
-    if isinstance(sa_raw, dict):
+    # Normalize service account into a plain dict
+    if isinstance(sa_raw, Mapping):        # handles AttrDict from Streamlit Secrets
+        sa_info = dict(sa_raw)
+    elif isinstance(sa_raw, dict):
         sa_info = sa_raw
     else:
         s = str(sa_raw)
         try:
-            sa_info = json.loads(s)  # JSON string with '\n' in private_key
+            sa_info = json.loads(s)        # JSON string with '\n' in private_key
         except json.JSONDecodeError:
-            # Common paste issue: real newlines -> escape them
+            # Common paste issue: real newlines → escape them
             s_fixed = s.replace("\r\n", "\n").replace("\n", "\\n")
             sa_info = json.loads(s_fixed)
 
