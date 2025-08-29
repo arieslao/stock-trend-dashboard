@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from sklearn.linear_model import LinearRegression
 import streamlit as st
 import plotly.express as px
+import yfinance as yf
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
@@ -30,23 +31,40 @@ def get_quote(symbol: str):
 
 @st.cache_data(ttl=120)
 def get_candles(symbol: str, days: int = 180, resolution="D"):
-    """Historical candles for the past N days."""
-    end = int(time.time())
-    start = int((datetime.now() - timedelta(days=days)).timestamp())
-    r = requests.get(
-        "https://finnhub.io/api/v1/stock/candle",
-        params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("s") != "ok":
-        raise RuntimeError(f"Finnhub returned {data}")
-    df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
-    df["time"] = pd.to_datetime(df["t"], unit="s")
-    df.rename(columns={"c": "close"}, inplace=True)
-    df.set_index("time", inplace=True)
-    return df
+    """Historical candles: try Finnhub; on 403 or error, fall back to Yahoo Finance."""
+    # --- First, try Finnhub
+    try:
+        end = int(time.time())
+        start = int((datetime.now() - timedelta(days=days)).timestamp())
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/candle",
+            params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("s") == "ok":
+            df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
+            df["time"] = pd.to_datetime(df["t"], unit="s")
+            df.rename(columns={"c": "close"}, inplace=True)
+            df.set_index("time", inplace=True)
+            return df
+        else:
+            # Fall through to Yahoo if Finnhub responds with error status
+            raise RuntimeError(f"Finnhub candles status: {data.get('s')}")
+    except Exception as e:
+        # --- Fallback: Yahoo Finance
+        # Map daily to 1d; intraday could map resolution '60' -> interval='60m'
+        interval = "1d" if resolution == "D" else "60m"
+        period_days = min(max(days, 5), 365*2)  # safety bounds
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=f"{period_days}d", interval=interval)
+        if hist.empty:
+            raise RuntimeError(f"Yahoo Finance returned no data for {symbol}") from e
+        df = hist.rename(columns={"Close": "close", "Open":"o", "High":"h", "Low":"l", "Volume":"v"})
+        df.index.name = "time"
+        return df[["o","h","l","close","v"]]
+
 
 def featurize(df: pd.DataFrame):
     out = df.copy()
