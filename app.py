@@ -2,6 +2,10 @@ import os, time, requests, json
 from datetime import datetime, timedelta
 from collections.abc import Mapping
 
+from collections.abc import Mapping
+import traceback
+
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -89,33 +93,40 @@ def fit_and_predict(df_features: pd.DataFrame):
     next_price = float(model.predict(last)[0])
     return model, next_price
 
+# Added this section to normalize the service-account info
+def _get_sa_info() -> dict:
+    """
+    Normalize Streamlit Secrets to a plain dict.
+    Accepts AttrDict/Mapping, dict, or JSON string (with or without \\n).
+    """
+    sa_raw = st.secrets["gsheets"]["service_account"]
+
+    if isinstance(sa_raw, Mapping):          # AttrDict from TOML table
+        return dict(sa_raw)
+    if isinstance(sa_raw, dict):             # plain dict
+        return sa_raw
+
+    s = str(sa_raw)
+    try:
+        return json.loads(s)                  # JSON string with '\n' in private_key
+    except json.JSONDecodeError:
+        s_fixed = s.replace("\r\n", "\n").replace("\n", "\\n")
+        return json.loads(s_fixed)
+
 # ---------- Google Sheets: robust connector ----------
 @st.cache_resource
 def get_ws():
     """
-    Connect to the 'predictions' worksheet (create if needed).
-    Robust to Secrets formatting:
-      - TOML table → AttrDict/Mapping
-      - Plain dict
-      - JSON string (with or without \n)
+    Connect to (or create) the 'predictions' worksheet.
+    Robust to Secrets formatting and includes Drive scope (safer for open_by_key).
     """
-    sa_raw = st.secrets["gsheets"]["service_account"]
+    sa_info = _get_sa_info()
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    client = gspread.service_account_from_dict(sa_info, scopes=scopes)
 
-    # Normalize service account into a plain dict
-    if isinstance(sa_raw, Mapping):        # handles AttrDict from Streamlit Secrets
-        sa_info = dict(sa_raw)
-    elif isinstance(sa_raw, dict):
-        sa_info = sa_raw
-    else:
-        s = str(sa_raw)
-        try:
-            sa_info = json.loads(s)        # JSON string with '\n' in private_key
-        except json.JSONDecodeError:
-            # Common paste issue: real newlines → escape them
-            s_fixed = s.replace("\r\n", "\n").replace("\n", "\\n")
-            sa_info = json.loads(s_fixed)
-
-    client = gspread.service_account_from_dict(sa_info)
     sh = client.open_by_key(st.secrets["gsheets"]["sheet_id"])
     try:
         ws = sh.worksheet("predictions")
@@ -127,6 +138,7 @@ def get_ws():
             "actual","err","pct_err","direction_correct"
         ])
     return ws
+
 
 def log_prediction(symbol, last_close, predicted, model_kind, params, train_window, features_desc, horizon="next_close"):
     ws = get_ws()
@@ -154,31 +166,37 @@ with st.sidebar:
     train_window= st.slider("Training window (days)", 60, 300, 120, 10)
 
 
-# ---------- Diagnostics (test Sheets connection) ----------
-with st.expander("🔧 Diagnostics"):
-    st.write("Google Sheet ID:", st.secrets.get("gsheets", {}).get("sheet_id", "(missing)"))
 
-    # 👇 Add THESE lines to see how Streamlit parsed your service account
-    sa_obj = st.secrets.get("gsheets", {}).get("service_account", None)
-    st.write("Service account format detected:", type(sa_obj).__name__)
-    if isinstance(sa_obj, dict):
-        # Show which keys exist (but not the private key contents)
-        st.write("Service account keys:", [k for k in sa_obj.keys() if k != "private_key"])
+# ---------- Diagnostics (test Sheets connection) ----------
+with st.expander("🔧 Diagnostics", expanded=False):
+    sheet_id = st.secrets.get("gsheets", {}).get("sheet_id", "(missing)")
+    st.write("Google Sheet ID:", sheet_id)
+
+    sa_raw = st.secrets.get("gsheets", {}).get("service_account", None)
+    st.write("Service account format detected:", type(sa_raw).__name__)
+    try:
+        sa_info_dbg = _get_sa_info()
+        st.write("Service account email:", sa_info_dbg.get("client_email", "(missing)"))
+    except Exception as e:
+        st.warning(f"Could not parse service account: {e!r}")
 
     if st.button("Test write to Google Sheet"):
         try:
-            log_prediction(
-                symbol="TEST",
-                last_close=100.0,
-                predicted=101.0,
-                model_kind=model_kind,
-                params=params,
-                train_window=train_window,
-                features_desc="diagnostic"
-            )
-            st.success("✅ Test row written to the 'predictions' worksheet. Check your Sheet.")
+            ws = get_ws()
+            ws.append_row([
+                datetime.utcnow().isoformat(timespec="seconds")+"Z",
+                "TEST","next_close",100.0,101.0,"Linear","{}",120,"diagnostic","","","",""
+            ])
+            st.success("✅ Test row written to 'predictions'. Check your Google Sheet.")
         except Exception as e:
-            st.error(f"❌ Failed to write: {e}")
+            st.error(f"❌ Failed to write: {e!r}")
+            st.caption("Full traceback:")
+            st.code(traceback.format_exc(), language="text")
+            st.info("Most common fixes:\n"
+                    "• Share the sheet with the service account email above (Editor).\n"
+                    "• Double-check the Sheet ID (between /d/ and /edit in the URL).\n"
+                    "• Ensure Secrets saved with no TOML error.")
+
 
 
 # ---------- Live KPI ----------
