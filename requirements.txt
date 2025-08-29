@@ -3,3 +3,4 @@ requests
 pandas
 scikit-learn
 plotly
+yfinance
