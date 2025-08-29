@@ -5,6 +5,8 @@ from sklearn.linear_model import LinearRegression
 import streamlit as st
 import plotly.express as px
 import yfinance as yf
+import gspread, json
+
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
@@ -81,6 +83,40 @@ def fit_and_predict(df_features: pd.DataFrame):
     next_price = float(model.predict(last)[0])
     return model, next_price
 
+
+@st.cache_resource
+def get_ws():
+    """Connect to the 'predictions' worksheet in your Google Sheet, creating it if needed."""
+    sa_info = st.secrets["gsheets"]["service_account"]
+    # secrets["gsheets"]["service_account"] comes in as a JSON string
+    if isinstance(sa_info, str):
+        sa_info = json.loads(sa_info)
+    client = gspread.service_account_from_dict(sa_info)
+    sh = client.open_by_key(st.secrets["gsheets"]["sheet_id"])
+    try:
+        ws = sh.worksheet("predictions")
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title="predictions", rows=1000, cols=30)
+        ws.append_row([
+            "timestamp_utc","symbol","horizon","last_close","predicted",
+            "model_kind","params_json","train_window","features",
+            "actual","err","pct_err","direction_correct"
+        ])
+    return ws
+
+def log_prediction(symbol, last_close, predicted, model_kind, params, train_window, features_desc, horizon="next_close"):
+    """Append a new prediction row to Google Sheets."""
+    ws = get_ws()
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    ws.append_row([
+        ts, symbol, horizon, last_close, predicted,
+        model_kind, json.dumps(params), int(train_window), features_desc,
+        "", "", "", ""  # placeholders for actual/error filled in later
+    ])
+
+
+
+
 # ---------- Sidebar / Controls ----------
 default_watchlist = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 with st.sidebar:
@@ -126,6 +162,22 @@ with col2:
             st.error(f"Potential SELL momentum / caution (<-{alert_pct}% ↓).")
         else:
             st.info("No strong signal at your threshold.")
+
+# --- log the prediction for learning ---
+features_desc = "MA10,MA50,ret_1,ret_5,vol_10,ma_cross"  # or however you define features
+log_prediction(
+    symbol=symbol,
+    last_close=float(df["close"].iloc[-1]),
+    predicted=float(next_price),
+    model_kind=model_kind,
+    params=params,
+    train_window=train_window,
+    features_desc=features_desc
+)
+
+
+
+
 
 # ---------- Watchlist Table ----------
 rows = []
