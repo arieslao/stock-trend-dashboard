@@ -6,3 +6,5 @@ plotly
 yfinance
 gspread
 google-auth
+tensorflow-cpu==2.15.*
+joblib
