@@ -1,47 +1,62 @@
-import os, time, requests, json
+# app.py
+import os, time, json, traceback
+from collections.abc import Mapping
 from datetime import datetime, timedelta
-from collections.abc import Mapping
 
-from collections.abc import Mapping
-import traceback
-
-
-import pandas as pd
 import numpy as np
+import pandas as pd
+from pandas.tseries.offsets import BDay
+
 import streamlit as st
 import plotly.express as px
 
-from sklearn.linear_model import LinearRegression
+import requests
 import yfinance as yf
+import joblib
+
+from sklearn.linear_model import LinearRegression
+
+import tensorflow as tf  # uses tensorflow-cpu in requirements
 import gspread
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
 st.title("📈 AI-Powered Stock Trend Dashboard")
-st.caption("Education only. Data: Finnhub (quotes) + Yahoo fallback (history). Forecasts: scikit-learn (Linear Regression).")
+st.caption("Education only. Quotes: Finnhub. History: Finnhub→Yahoo fallback. Model: CNN-LSTM (pretrained) with multi-horizon forecasts.")
 
-# ---------- API Key ----------
+# ---------- Keys / Constants ----------
 API_KEY = st.secrets.get("FINNHUB_KEY", os.environ.get("FINNHUB_KEY", ""))
 if not API_KEY:
-    st.error("Missing FINNHUB_KEY. In Streamlit Cloud, set it in 'Advanced settings → Secrets'.")
+    st.error("Missing FINNHUB_KEY. In Streamlit Cloud, set it in Settings → Advanced → Secrets.")
     st.stop()
+
+HORIZONS = (1, 3, 5, 10, 20)  # business-day horizons we predict/log
+WINDOW = 60  # days of history used by CNN-LSTM
 
 # ---------- Data Helpers ----------
 @st.cache_data(ttl=60)
 def get_quote(symbol: str):
-    """Live quote for a symbol. Cached for 60s to respect rate limits."""
-    r = requests.get(
-        "https://finnhub.io/api/v1/quote",
-        params={"symbol": symbol, "token": API_KEY},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()
+    """Live quote (cached 60s to respect rate limits)."""
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": symbol, "token": API_KEY},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        # Fallback to Yahoo last close if Finnhub blocked
+        tkr = yf.Ticker(symbol)
+        h = tkr.history(period="5d", interval="1d")
+        if h.empty:
+            raise
+        return {"c": float(h["Close"].iloc[-1])}
 
 @st.cache_data(ttl=120)
 def get_candles(symbol: str, days: int = 180, resolution="D"):
     """Historical candles: try Finnhub; on error, fall back to Yahoo Finance."""
-    # --- Try Finnhub first
+    # Try Finnhub first
     try:
         end = int(time.time())
         start = int((datetime.now() - timedelta(days=days)).timestamp())
@@ -53,72 +68,63 @@ def get_candles(symbol: str, days: int = 180, resolution="D"):
         r.raise_for_status()
         data = r.json()
         if data.get("s") == "ok":
-            df = pd.DataFrame({
-                "t": data["t"], "o": data["o"], "h": data["h"],
-                "l": data["l"], "c": data["c"], "v": data["v"]
-            })
+            df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
             df["time"] = pd.to_datetime(df["t"], unit="s")
             df.rename(columns={"c": "close"}, inplace=True)
             df.set_index("time", inplace=True)
-            return df
-        # else fall through to Yahoo
+            return df[["o", "h", "l", "close", "v"]]
     except Exception:
         pass
 
-    # --- Yahoo fallback
+    # Yahoo fallback
     interval = "1d" if resolution == "D" else "60m"
     period_days = min(max(days, 5), 365 * 2)
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period=f"{period_days}d", interval=interval)
+    tkr = yf.Ticker(symbol)
+    hist = tkr.history(period=f"{period_days}d", interval=interval)
     if hist.empty:
-        raise RuntimeError(f"Yahoo Finance returned no data for {symbol}")
-    df = hist.rename(columns={
-        "Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"
-    })
+        raise RuntimeError(f"No history for {symbol}")
+    df = hist.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
     df.index.name = "time"
     return df[["o", "h", "l", "close", "v"]]
 
 def featurize(df: pd.DataFrame):
     out = df.copy()
-    out["MA10"]  = out["close"].rolling(10).mean()
-    out["MA50"]  = out["close"].rolling(50).mean()
-    out = out.dropna()
-    return out
+    out["MA10"] = out["close"].rolling(10).mean()
+    out["MA50"] = out["close"].rolling(50).mean()
+    return out.dropna()
 
-def fit_and_predict(df_features: pd.DataFrame):
-    X = df_features[["MA10", "MA50"]]
-    y = df_features["close"]
-    model = LinearRegression().fit(X, y)
-    last = df_features.iloc[-1][["MA10", "MA50"]].values.reshape(1, -1)
-    next_price = float(model.predict(last)[0])
-    return model, next_price
+# ---------- Simple Targets (support/resistance/trendline) ----------
+def simple_targets(df, lookback=60):
+    d = df.tail(lookback).copy()
+    support = float(d["close"].min())
+    resistance = float(d["close"].max())
+    x = np.arange(len(d)).reshape(-1, 1)
+    lr = LinearRegression().fit(x, d["close"].values)
+    trend_target = float(lr.predict([[len(d)]])[0])
+    return {"support": support, "resistance": resistance, "trend_target": trend_target}
 
-# Added this section to normalize the service-account info
+# ---------- Google Sheets: Secrets & Worksheet ----------
 def _get_sa_info() -> dict:
     """
     Normalize Streamlit Secrets to a plain dict.
     Accepts AttrDict/Mapping, dict, or JSON string (with or without \\n).
     """
     sa_raw = st.secrets["gsheets"]["service_account"]
-
-    if isinstance(sa_raw, Mapping):          # AttrDict from TOML table
+    if isinstance(sa_raw, Mapping):
         return dict(sa_raw)
-    if isinstance(sa_raw, dict):             # plain dict
+    if isinstance(sa_raw, dict):
         return sa_raw
-
     s = str(sa_raw)
     try:
-        return json.loads(s)                  # JSON string with '\n' in private_key
+        return json.loads(s)
     except json.JSONDecodeError:
         s_fixed = s.replace("\r\n", "\n").replace("\n", "\\n")
         return json.loads(s_fixed)
 
-# ---------- Google Sheets: robust connector ----------
 @st.cache_resource
 def get_ws():
     """
-    Connect to (or create) the 'predictions' worksheet.
-    Robust to Secrets formatting and includes Drive scope (safer for open_by_key).
+    Connect/create 'predictions' worksheet. Ensure header covers all fields.
     """
     sa_info = _get_sa_info()
     scopes = [
@@ -126,52 +132,123 @@ def get_ws():
         "https://www.googleapis.com/auth/drive",
     ]
     client = gspread.service_account_from_dict(sa_info, scopes=scopes)
-
     sh = client.open_by_key(st.secrets["gsheets"]["sheet_id"])
     try:
         ws = sh.worksheet("predictions")
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="predictions", rows=1000, cols=30)
+        ws = sh.add_worksheet(title="predictions", rows=2000, cols=30)
         ws.append_row([
             "timestamp_utc","symbol","horizon","last_close","predicted",
-            "model_kind","params_json","train_window","features",
-            "actual","err","pct_err","direction_correct"
+            "pct_change","signal","scope","model_kind","params_json",
+            "train_window","features","actual","err","pct_err","direction_correct"
         ])
+        return ws
+
+    wanted = [
+        "timestamp_utc","symbol","horizon","last_close","predicted",
+        "pct_change","signal","scope","model_kind","params_json",
+        "train_window","features","actual","err","pct_err","direction_correct"
+    ]
+    current = ws.row_values(1) or []
+    if current != wanted:
+        try:
+            need = len(wanted) - ws.col_count
+            if need > 0:
+                ws.add_cols(need)
+        except Exception:
+            pass
+        ws.update("A1", [wanted])
     return ws
 
-
-def log_prediction(symbol, last_close, predicted, model_kind, params, train_window, features_desc, horizon="next_close"):
+def log_prediction(
+    symbol,
+    horizon,           # "1d","3d"...
+    last_close,
+    predicted,
+    pct_change,
+    signal,            # BUY/SELL/HOLD
+    scope,             # "focus" or "watchlist"
+    model_kind,
+    params,
+    train_window,
+    features_desc,
+):
     ws = get_ws()
     ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     ws.append_row([
-        ts, symbol, horizon, last_close, predicted,
-        model_kind, json.dumps(params), int(train_window), features_desc,
-        "", "", "", ""  # placeholders for later reconciliation
+        ts, symbol, horizon, float(last_close), float(predicted),
+        float(pct_change), signal, scope, model_kind, json.dumps(params),
+        int(train_window) if train_window is not None else None, features_desc,
+        "", "", "", ""  # actuals filled by reconcile
     ])
+
+# ---------- CNN-LSTM Loader & Predictor ----------
+@st.cache_resource
+def load_cnn_lstm():
+    mdl = tf.keras.models.load_model("models/cnn_lstm_ALL.keras", compile=False)
+    pack = joblib.load("models/scaler_ALL.pkl")  # {"scaler":..., "feats":[...]}
+    return mdl, pack["scaler"], pack["feats"]
+
+def predict_cnn_lstm_for_symbol(df: pd.DataFrame, model, scaler, feats, horizons=HORIZONS, window=WINDOW):
+    d = df.copy()
+    d["ret1"] = d["close"].pct_change()
+    d["ma10"] = d["close"].rolling(10).mean()
+    d["ma50"] = d["close"].rolling(50).mean()
+    d["vlog"] = np.log1p(d["v"])
+    d = d.dropna()
+    if len(d) < window + 1:
+        return {}
+    # align to training feature order
+    Xf = d[feats].values
+    Xs = scaler.transform(Xf)  # (T,F)
+    win = Xs[-window:]
+    x = np.expand_dims(win, 0)  # (1,W,F)
+    yhat_scaled = model.predict(x, verbose=0)[0]  # len(horizons)
+
+    out = {}
+    for i, h in enumerate(horizons):
+        dummy = np.zeros((1, len(feats)))
+        dummy[0, feats.index("close")] = yhat_scaled[i]
+        inv = scaler.inverse_transform(dummy)[0, feats.index("close")]
+        out[h] = float(inv)
+    return out
+
+# ---------- Linear Baseline (fallback) ----------
+def predict_multi_horizon_linear(df: pd.DataFrame, horizons=HORIZONS):
+    feat = featurize(df)
+    preds = {}
+    for h in horizons:
+        tmp = feat.copy()
+        tmp["target"] = tmp["close"].shift(-h)
+        tmp = tmp.dropna()
+        if len(tmp) < 10:
+            continue
+        X = tmp[["MA10","MA50"]]
+        y = tmp["target"]
+        m = LinearRegression().fit(X, y)
+        preds[h] = float(m.predict(feat[["MA10","MA50"]].tail(1))[0])
+    return preds
 
 # ---------- Sidebar / Controls ----------
 default_watchlist = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 with st.sidebar:
     st.header("Controls")
     watchlist   = st.multiselect("Watchlist", default_watchlist, default=default_watchlist)
-    days        = st.slider("History (days)", 90, 365, 180, step=10)
-    alert_pct   = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.5)
+    days        = st.slider("History (days)", 120, 730, 365, step=30)  # CNN window 60; give enough history
+    alert_pct   = st.slider("Signal threshold (%)", 0.5, 10.0, 2.0, step=0.5)
     symbol      = st.selectbox("Focus symbol", watchlist or default_watchlist)
     st.markdown("**Note:** Free Finnhub keys allow ~60 requests/min.")
     st.divider()
 
     st.subheader("Model")
-    model_kind  = st.selectbox("Choose model", ["Linear"])
-    params      = {}
-    train_window= st.slider("Training window (days)", 60, 300, 120, 10)
+    model_kind  = st.selectbox("Choose model", ["CNN-LSTM (pretrained)", "Linear baseline"])
+    train_window= st.slider("Baseline training window (days)", 60, 360, 180, 10)  # for logging only (baseline)
+    params      = {}  # reserved for future hyperparams
 
-
-
-# ---------- Diagnostics (test Sheets connection) ----------
+# ---------- Diagnostics ----------
 with st.expander("🔧 Diagnostics", expanded=False):
     sheet_id = st.secrets.get("gsheets", {}).get("sheet_id", "(missing)")
     st.write("Google Sheet ID:", sheet_id)
-
     sa_raw = st.secrets.get("gsheets", {}).get("service_account", None)
     st.write("Service account format detected:", type(sa_raw).__name__)
     try:
@@ -185,90 +262,225 @@ with st.expander("🔧 Diagnostics", expanded=False):
             ws = get_ws()
             ws.append_row([
                 datetime.utcnow().isoformat(timespec="seconds")+"Z",
-                "TEST","next_close",100.0,101.0,"Linear","{}",120,"diagnostic","","","",""
+                "TEST","1d",100.0,101.0,1.0,"HOLD","diagnostic","DiagModel","{}",120,"diag","","","",""
             ])
             st.success("✅ Test row written to 'predictions'. Check your Google Sheet.")
         except Exception as e:
             st.error(f"❌ Failed to write: {e!r}")
             st.caption("Full traceback:")
             st.code(traceback.format_exc(), language="text")
-            st.info("Most common fixes:\n"
-                    "• Share the sheet with the service account email above (Editor).\n"
-                    "• Double-check the Sheet ID (between /d/ and /edit in the URL).\n"
-                    "• Ensure Secrets saved with no TOML error.")
-
-
 
 # ---------- Live KPI ----------
 try:
     quote = get_quote(symbol)
-    price = quote["c"]
+    price = float(quote["c"])
     st.subheader(f"{symbol} — Live: {price:,.2f}")
 except Exception as e:
     st.error(f"Quote error for {symbol}: {e}")
     st.stop()
 
-# ---------- Chart + Forecast ----------
+# ---------- Chart + Forecast (Focus symbol) ----------
 col1, col2 = st.columns([3, 1])
 with col1:
     try:
-        df   = get_candles(symbol, days=days, resolution="D")
+        df = get_candles(symbol, days=days, resolution="D")
         feat = featurize(df)
-        model, next_price = fit_and_predict(feat)
-        pct_change = 100.0 * (next_price - df["close"].iloc[-1]) / df["close"].iloc[-1]
 
+        # Plot with MAs
         line = px.line(df.reset_index(), x="time", y="close", title=f"{symbol} Close Price")
-        line.add_scatter(x=feat.index, y=feat["MA10"], mode="lines", name="MA10")
-        line.add_scatter(x=feat.index, y=feat["MA50"], mode="lines", name="MA50")
+        if not feat.empty:
+            line.add_scatter(x=feat.index, y=feat["MA10"], mode="lines", name="MA10")
+            line.add_scatter(x=feat.index, y=feat["MA50"], mode="lines", name="MA50")
         st.plotly_chart(line, use_container_width=True)
 
-        # --- Log the prediction only if it succeeded ---
-        features_desc = "MA10,MA50"
-        try:
+        # Targets
+        tgt = simple_targets(df, lookback=min(60, len(df)))
+        st.caption(f"Targets · Support: {tgt['support']:.2f} · Resistance: {tgt['resistance']:.2f} · Trend: {tgt['trend_target']:.2f}")
+
+        # Predictions (CNN-LSTM preferred)
+        mh = {}
+        used_model = model_kind
+        if model_kind.startswith("CNN"):
+            try:
+                mdl, scaler, feats = load_cnn_lstm()
+                mh = predict_cnn_lstm_for_symbol(df, mdl, scaler, feats, horizons=HORIZONS, window=WINDOW)
+            except Exception as e:
+                st.warning(f"Deep model unavailable, falling back to baseline: {e}")
+                used_model = "Linear baseline"
+        if not mh:  # fallback or if user chose baseline
+            mh = predict_multi_horizon_linear(df, horizons=HORIZONS)
+
+        last_close = float(df["close"].iloc[-1])
+
+        # Log focus symbol for all horizons
+        for h, pred in mh.items():
+            pct = 100.0 * (pred - last_close) / last_close
+            sig = "BUY" if pct >= alert_pct else ("SELL" if pct <= -alert_pct else "HOLD")
             log_prediction(
                 symbol=symbol,
-                last_close=float(df["close"].iloc[-1]),
-                predicted=float(next_price),
-                model_kind=model_kind,
+                horizon=f"{h}d",
+                last_close=last_close,
+                predicted=pred,
+                pct_change=pct,
+                signal=sig,
+                scope="focus",
+                model_kind=used_model,
                 params=params,
                 train_window=train_window,
-                features_desc=features_desc
+                features_desc="MA10,MA50 (+ret1,vlog in CNN)",
             )
-        except Exception as e:
-            st.warning(f"Logged locally but failed to write to Google Sheet: {e}")
 
     except Exception as e:
         st.error(f"History/forecast error: {e}")
 
 with col2:
-    st.metric(
-        "Predicted next close",
-        f"{next_price:,.2f}" if "next_price" in locals() else "—",
-        f"{pct_change:+.2f}% vs last" if "pct_change" in locals() else None
-    )
-    if "pct_change" in locals():
-        if pct_change >= alert_pct:
-            st.success(f"Potential BUY momentum (>{alert_pct}% ↑).")
-        elif pct_change <= -alert_pct:
-            st.error(f"Potential SELL momentum / caution (<-{alert_pct}% ↓).")
-        else:
-            st.info("No strong signal at your threshold.")
+    # Show 1-day horizon on the KPI card
+    try:
+        # recompute mh here if needed (for KPI only)
+        # To avoid recompute, we could cache mh; for simplicity, recompute fast baseline if missing.
+        if 'mh' not in locals() or 1 not in mh:
+            mh = mh if 'mh' in locals() else {}
+            if 1 not in mh:
+                mh = predict_multi_horizon_linear(df, horizons=HORIZONS)
+        next_1d = mh.get(1, np.nan)
+        pct_1d = 100.0 * (next_1d - df["close"].iloc[-1]) / df["close"].iloc[-1]
+        st.metric(
+            "Predicted next close (1d)",
+            f"{next_1d:,.2f}" if np.isfinite(next_1d) else "—",
+            f"{pct_1d:+.2f}% vs last" if np.isfinite(pct_1d) else None
+        )
+        if np.isfinite(pct_1d):
+            if pct_1d >= alert_pct:
+                st.success(f"Potential BUY (≥ {alert_pct}%)")
+            elif pct_1d <= -alert_pct:
+                st.error(f"Potential SELL (≤ -{alert_pct}%)")
+            else:
+                st.info("HOLD at current threshold.")
+    except Exception:
+        st.metric("Predicted next close (1d)", "—")
 
-# ---------- Watchlist Table ----------
+# ---------- Watchlist Table + Logging ----------
 rows = []
 for s in watchlist:
     try:
-        q = get_quote(s); p = q["c"]
+        q = get_quote(s); p = float(q["c"])
         d = get_candles(s, days=days)
-        f = featurize(d)
-        _, nxt = fit_and_predict(f)
-        ret = 100.0 * (nxt - d["close"].iloc[-1]) / d["close"].iloc[-1]
-        signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
-        rows.append({"Symbol": s, "Last": round(p,2), "Predicted": round(nxt,2), "Δ%": round(ret,2), "Signal": signal})
+        # Predict
+        preds = {}
+        if model_kind.startswith("CNN"):
+            try:
+                mdl, scaler, feats = load_cnn_lstm()
+                preds = predict_cnn_lstm_for_symbol(d, mdl, scaler, feats, horizons=HORIZONS, window=WINDOW)
+            except Exception:
+                preds = predict_multi_horizon_linear(d, horizons=HORIZONS)
+        else:
+            preds = predict_multi_horizon_linear(d, horizons=HORIZONS)
+
+        last_c = float(d["close"].iloc[-1])
+        # Use 1-day horizon for table ranking
+        nxt = preds.get(1, last_c)
+        ret = 100.0 * (nxt - last_c) / last_c
+        signal = "BUY" if ret >= alert_pct else ("SELL" if ret <= -alert_pct else "HOLD")
+        rows.append({"Symbol": s, "Last": round(p,2), "Predicted(1d)": round(nxt,2), "Δ%(1d)": round(ret,2), "Signal": signal})
+
+        # Log all horizons for watchlist symbols
+        for h, pred in preds.items():
+            pct = 100.0 * (pred - last_c) / last_c
+            sig = "BUY" if pct >= alert_pct else ("SELL" if pct <= -alert_pct else "HOLD")
+            log_prediction(
+                symbol=s,
+                horizon=f"{h}d",
+                last_close=last_c,
+                predicted=pred,
+                pct_change=pct,
+                signal=sig,
+                scope="watchlist",
+                model_kind=model_kind,
+                params=params,
+                train_window=train_window,
+                features_desc="MA10,MA50 (+ret1,vlog in CNN)",
+            )
+
     except Exception:
-        rows.append({"Symbol": s, "Last": None, "Predicted": None, "Δ%": None, "Signal": "ERR"})
+        rows.append({"Symbol": s, "Last": None, "Predicted(1d)": None, "Δ%(1d)": None, "Signal": "ERR"})
 
 if rows:
-    table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False)
-    st.subheader("Watchlist signals")
+    table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%(1d)", ascending=False)
+    st.subheader("Watchlist signals (1-day)")
     st.dataframe(table, use_container_width=True)
+
+# ---------- Reconcile & Accuracy ----------
+def reconcile_predictions():
+    """Fill actual outcomes for rows whose horizon date has passed (business days)."""
+    import math
+    ws = get_ws()
+    rows = ws.get_all_records()
+    if not rows:
+        return "No rows to reconcile."
+    header = ws.row_values(1)
+    cols = {name: i+1 for i, name in enumerate(header)}
+    updated = 0
+    for idx, r in enumerate(rows, start=2):
+        if r.get("actual"):
+            continue
+        try:
+            ts = pd.to_datetime(r["timestamp_utc"])
+            h = int(str(r["horizon"]).lower().strip("d"))
+        except Exception:
+            continue
+        due = (ts + BDay(h)).normalize()
+        if pd.Timestamp.utcnow().normalize() < due:
+            continue  # not due yet
+        sym = r["symbol"]
+        try:
+            tkr = yf.Ticker(sym)
+            hist = tkr.history(start=due.tz_localize(None).date(), end=(due + BDay(5)).date())
+            if hist.empty:
+                continue
+            actual = float(hist["Close"].iloc[0])
+            predicted = float(r["predicted"])
+            last_close = float(r["last_close"])
+            err = actual - predicted
+            pct_err = (err / actual) * 100.0 if actual else None
+            dir_ok = int(np.sign(predicted - last_close) == np.sign(actual - last_close))
+            ws.update_cell(idx, cols["actual"], actual)
+            ws.update_cell(idx, cols["err"], err)
+            ws.update_cell(idx, cols["pct_err"], pct_err)
+            ws.update_cell(idx, cols["direction_correct"], dir_ok)
+            updated += 1
+        except Exception:
+            continue
+    return f"Reconciled {updated} row(s)."
+
+with st.expander("📊 Model accuracy"):
+    if st.button("Reconcile predictions now"):
+        msg = reconcile_predictions()
+        st.success(msg)
+    try:
+        ws = get_ws()
+        dfp = pd.DataFrame(ws.get_all_records())
+        if not dfp.empty and "actual" in dfp.columns:
+            dfp = dfp[dfp["actual"] != ""].copy()
+            if not dfp.empty:
+                # coerce types
+                for c in ["actual","predicted"]:
+                    dfp[c] = pd.to_numeric(dfp[c], errors="coerce")
+                dfp["err_abs"] = (dfp["actual"] - dfp["predicted"]).abs()
+                dfp["mape"] = (dfp["err_abs"] / dfp["actual"].replace(0, np.nan)).abs() * 100
+                dfp["dir_ok"] = pd.to_numeric(dfp["direction_correct"], errors="coerce")
+                summary = (dfp.groupby("horizon")
+                              .agg(n=("symbol","count"),
+                                   MAE=("err_abs","mean"),
+                                   MAPE=("mape","mean"),
+                                   DirectionalAcc=("dir_ok","mean"))
+                              .sort_index())
+                summary["MAE"] = summary["MAE"].round(3)
+                summary["MAPE"] = summary["MAPE"].round(2)
+                summary["DirectionalAcc"] = (summary["DirectionalAcc"]*100).round(1).astype(str) + "%"
+                st.dataframe(summary, use_container_width=True)
+            else:
+                st.info("No reconciled rows yet — click the button after horizons have passed.")
+        else:
+            st.info("Sheet empty or not reconciled yet.")
+    except Exception as e:
+        st.warning(f"Could not load accuracy summary: {e}")
