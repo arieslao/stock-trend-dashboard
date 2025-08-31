@@ -4,6 +4,12 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import pickle
+# --- Optional / safe TF import (only used if you pick the CNN-LSTM model) ---
+try:
+    import tensorflow as tf  # noqa: F401
+except Exception:
+    tf = None  # we’ll gracefully fall back to Linear if TF isn’t available
+
 
 # --- CNN-LSTM / scaling ---
 import numpy as np
@@ -134,27 +140,36 @@ def load_cnn_lstm(symbol: str):
     Try multiple filenames/locations and support both .keras and .h5.
     Returns a tf.keras.Model or None.
     """
+    if tf is None:
+        st.warning("TensorFlow is not available in this runtime; using Linear model instead.")
+        return None
+
+    from pathlib import Path
+
     candidates = [
-        Path("models") / f"{symbol.upper()}_cnn_lstm.h5",
         Path("models") / f"{symbol.upper()}_cnn_lstm.keras",
-        Path("models") / "cnn_lstm_generic.h5",
-        Path("models") / "cnn_lstm_generic.keras",
+        Path("models") / f"{symbol.upper()}_cnn_lstm.h5",
+        Path("models") / "cnn_lstm_ALL.keras",   # <--- your file
         Path("models") / "cnn_lstm_ALL.h5",
-        Path("models") / "cnn_lstm_ALL.keras",
-        Path("cnn_lstm_ALL.h5"),      # if someone put it at repo root
+        Path("models") / "cnn_lstm_generic.keras",
+        Path("models") / "cnn_lstm_generic.h5",
         Path("cnn_lstm_ALL.keras"),
+        Path("cnn_lstm_ALL.h5"),
     ]
     for p in candidates:
         if p.exists():
             try:
-                model = tf.keras.models.load_model(p)
+                # compile=False is fine for inference; prevents missing loss/optimizer errors
+                model = tf.keras.models.load_model(p, compile=False)
                 st.session_state["cnn_model_path"] = str(p)
                 return model
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load: {e}")
-                # try the next candidate
+                # Try next candidate
+
     st.info("CNN-LSTM model file not found; using Linear model instead.")
     return None
+
 
 
 @st.cache_resource
