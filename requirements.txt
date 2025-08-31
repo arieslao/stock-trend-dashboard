@@ -10,7 +10,7 @@ joblib==1.4.2
 
 # Google Sheets
 gspread==6.1.2
-google-auth==2.31.0
+google-auth==2.33.0
 
 #TensorFlow dependencies
 tensorflow-cpu==2.15.0
