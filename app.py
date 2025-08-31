@@ -59,39 +59,94 @@ def get_quote(symbol: str):
             raise
         return {"c": float(h["Close"].iloc[-1])}
 
+#--------Replaced Get Candles w/ a Hardened version below--------
 @st.cache_data(ttl=120)
-def get_candles(symbol: str, days: int = 180, resolution="D"):
-    """Historical candles: try Finnhub; on error, fall back to Yahoo Finance."""
-    # Try Finnhub first
+def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataFrame:
+    """Return OHLCV indexed by time. Try Finnhub; on any issue, fall back to Yahoo (two ways)."""
+    # ---------- Try Finnhub ----------
     try:
         end = int(time.time())
         start = int((datetime.now() - timedelta(days=days)).timestamp())
         r = requests.get(
             "https://finnhub.io/api/v1/stock/candle",
-            params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
+            params={
+                "symbol": symbol,
+                "resolution": resolution,  # "D" for daily
+                "from": start,
+                "to": end,
+                "token": API_KEY,
+            },
             timeout=15,
         )
         r.raise_for_status()
         data = r.json()
-        if data.get("s") == "ok":
-            df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
+        if data.get("s") == "ok" and data.get("t"):
+            df = pd.DataFrame(
+                {"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]}
+            )
             df["time"] = pd.to_datetime(df["t"], unit="s")
             df.rename(columns={"c": "close"}, inplace=True)
             df.set_index("time", inplace=True)
             return df[["o", "h", "l", "close", "v"]]
+        # if not "ok", fall through to Yahoo
     except Exception:
-        pass
+        pass  # fall through to Yahoo
 
-    # Yahoo fallback
-    interval = "1d" if resolution == "D" else "60m"
-    period_days = min(max(days, 5), 365 * 2)
-    tkr = yf.Ticker(symbol)
-    hist = tkr.history(period=f"{period_days}d", interval=interval)
-    if hist.empty:
-        raise RuntimeError(f"No history for {symbol}")
-    df = hist.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
-    df.index.name = "time"
-    return df[["o", "h", "l", "close", "v"]]
+    # ---------- Yahoo fallback (with browser UA) ----------
+    try:
+        import requests as _req
+        sess = _req.Session()
+        # many providers reject default python UA; this mimics a browser
+        sess.headers["User-Agent"] = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        )
+
+        interval = "1d" if resolution == "D" else "60m"
+        period_days = min(max(days, 5), 365 * 2)
+        tk = yf.Ticker(symbol, session=sess)
+        hist = tk.history(period=f"{period_days}d", interval=interval, auto_adjust=False)
+        if hist is not None and not hist.empty:
+            df = hist.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
+            df.index.name = "time"
+            return df[["o", "h", "l", "close", "v"]]
+    except Exception:
+        pass  # try one more way
+
+    # ---------- Yahoo second path (download) ----------
+    try:
+        import requests as _req
+        sess2 = _req.Session()
+        sess2.headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        )
+        start_dt = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_dt = datetime.now().strftime("%Y-%m-%d")
+        dl = yf.download(
+            symbol,
+            start=start_dt,
+            end=end_dt,
+            interval="1d",
+            progress=False,
+            group_by="ticker",
+            session=sess2,
+            auto_adjust=False,
+            threads=False,  # serial sometimes avoids throttling issues
+        )
+        if isinstance(dl, pd.DataFrame) and not dl.empty:
+            if "Adj Close" in dl.columns:  # wide form
+                # normalize to single-symbol frame if yahoo returns multi-index
+                if isinstance(dl.columns, pd.MultiIndex):
+                    dl = dl.xs(symbol, axis=1, level=0, drop_level=True)
+            df = dl.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
+            df.index.name = "time"
+            return df[["o", "h", "l", "close", "v"]]
+    except Exception as e:
+        raise RuntimeError(f"No history for {symbol}: {e}")
+
+    # If we get here, both Yahoo attempts were empty
+    raise RuntimeError(f"No history for {symbol}: Yahoo returned empty data")
 
 def featurize(df: pd.DataFrame):
     out = df.copy()
@@ -278,6 +333,26 @@ with st.expander("🔧 Diagnostics", expanded=False):
             st.error(f"❌ Failed to write: {e!r}")
             st.caption("Full traceback:")
             st.code(traceback.format_exc(), language="text")
+
+with st.expander("🛠 Diagnostics"):
+    st.write("Python:", __import__("sys").version.split()[0])
+    if st.button("Test Finnhub candles (AAPL, 30d)"):
+        try:
+            _ = get_candles("AAPL", days=30, resolution="D")
+            st.success("Finnhub OK")
+        except Exception as e:
+            st.error(f"Finnhub failed: {e}")
+
+    if st.button("Test Yahoo fallback (AAPL, 30d)"):
+        try:
+            # call directly without cache to see a fresh request
+            st.cache_data.clear()
+            _ = get_candles("AAPL", days=30, resolution="D")
+            st.success("Yahoo OK")
+        except Exception as e:
+            st.error(f"Yahoo failed: {e}")
+
+
 
 # ---------- Live KPI ----------
 try:
