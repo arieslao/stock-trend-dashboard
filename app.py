@@ -13,6 +13,8 @@ import plotly.express as px
 import requests
 import yfinance as yf
 import joblib
+from io import StringIO
+
 
 from sklearn.linear_model import LinearRegression
 
@@ -64,9 +66,15 @@ def get_quote(symbol: str):
 #--------Replaced Get Candles w/ a Hardened version below--------
 @st.cache_data(ttl=120)
 def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataFrame:
-    """Return OHLCV indexed by time with multi-source fallback:
-       Finnhub → yfinance(history) → yfinance(download) → Yahoo Chart JSON → Stooq.
+    """Return OHLCV indexed by time with robust fallback:
+       Finnhub → yfinance(history) → yfinance(download) → Yahoo Chart JSON → Stooq → mirror fetches.
     """
+    # ---------- 0) helpers ----------
+    def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df.index.name = "time"
+        return df[["o", "h", "l", "close", "v"]]
+
     # ---------- 1) Finnhub ----------
     try:
         end = int(time.time())
@@ -77,24 +85,20 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
             headers={"Accept": "application/json"},
             timeout=15,
         )
-        # If you’re rate limited, this is usually 403 HTML; the next line will raise for that.
         r.raise_for_status()
-        if "application/json" in r.headers.get("content-type", ""):
-            data = r.json()
-        else:
-            raise RuntimeError(f"Finnhub non-JSON response: {r.status_code}")
+        if "application/json" not in r.headers.get("content-type", ""):
+            raise RuntimeError("Finnhub non-JSON")
+        data = r.json()
         if data.get("s") == "ok" and data.get("t"):
-            df = pd.DataFrame(
-                {"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]}
-            )
+            df = pd.DataFrame({"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]})
             df["time"] = pd.to_datetime(df["t"], unit="s")
             df.rename(columns={"c": "close"}, inplace=True)
             df.set_index("time", inplace=True)
-            return df[["o", "h", "l", "close", "v"]]
+            return _normalize_ohlcv(df)
     except Exception:
-        pass  # fall through to Yahoo
+        pass
 
-    # ---------- 2) Yahoo / yfinance (two tries, browser UA) ----------
+    # ---------- 2) Yahoo / yfinance (history) ----------
     try:
         import requests as _req
         sess = _req.Session()
@@ -109,10 +113,11 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         if hist is not None and not hist.empty:
             df = hist.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
             df.index.name = "time"
-            return df[["o", "h", "l", "close", "v"]]
+            return _normalize_ohlcv(df)
     except Exception:
         pass
 
+    # ---------- 3) Yahoo / yfinance (download) ----------
     try:
         import requests as _req
         sess2 = _req.Session()
@@ -123,26 +128,20 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         start_dt = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         end_dt = datetime.now().strftime("%Y-%m-%d")
         dl = yf.download(
-            symbol,
-            start=start_dt,
-            end=end_dt,
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            session=sess2,
-            auto_adjust=False,
-            threads=False,
+            symbol, start=start_dt, end=end_dt,
+            interval="1d", progress=False, group_by="ticker",
+            session=sess2, auto_adjust=False, threads=False,
         )
         if isinstance(dl, pd.DataFrame) and not dl.empty:
             if isinstance(dl.columns, pd.MultiIndex):
                 dl = dl.xs(symbol, axis=1, level=0, drop_level=True)
             df = dl.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
             df.index.name = "time"
-            return df[["o", "h", "l", "close", "v"]]
+            return _normalize_ohlcv(df)
     except Exception:
-        pass  # fall through to Yahoo Chart JSON
+        pass
 
-    # ---------- 3) Yahoo Chart JSON (often works when yfinance is blocked) ----------
+    # ---------- 4) Yahoo Chart JSON ----------
     try:
         import requests as _req
         sess3 = _req.Session()
@@ -153,13 +152,7 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         end = int(time.time())
         start = end - int(days * 86400)
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "period1": start,
-            "period2": end,
-            "interval": "1d",
-            "includePrePost": "false",
-            "events": "div,splits",
-        }
+        params = {"period1": start, "period2": end, "interval": "1d", "includePrePost": "false", "events": "div,splits"}
         r = sess3.get(url, params=params, timeout=15)
         r.raise_for_status()
         j = r.json()
@@ -167,47 +160,89 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         ts = res.get("timestamp", [])
         q = res.get("indicators", {}).get("quote", [{}])[0]
         if ts and "close" in q:
-            df = pd.DataFrame(
-                {"time": pd.to_datetime(ts, unit="s"),
-                 "o": q.get("open", []),
-                 "h": q.get("high", []),
-                 "l": q.get("low", []),
-                 "close": q.get("close", []),
-                 "v": q.get("volume", []),}
-            )
+            df = pd.DataFrame({"time": pd.to_datetime(ts, unit="s"),
+                               "o": q.get("open", []), "h": q.get("high", []),
+                               "l": q.get("low", []),  "close": q.get("close", []),
+                               "v": q.get("volume", [])})
             df = df.dropna(subset=["time"]).set_index("time").sort_index()
             if not df.empty:
-                return df[["o", "h", "l", "close", "v"]]
+                return _normalize_ohlcv(df)
     except Exception:
-        pass  # fall through to Stooq
+        pass
 
-    # ---------- 4) Stooq CSV fallback (AAPL -> aapl.us) ----------
+    # ---------- 4b) Yahoo Chart JSON via mirror (if blocked) ----------
+    try:
+        # mirror fetch: r.jina.ai returns the body of the target URL (public pages)
+        end = int(time.time())
+        start = end - int(days * 86400)
+        mirror = "https://r.jina.ai/http://query1.finance.yahoo.com/v8/finance/chart/"
+        r = requests.get(mirror + symbol, params={
+            "period1": start, "period2": end, "interval": "1d",
+            "includePrePost": "false", "events": "div,splits"},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        j = r.json()
+        res = j["chart"]["result"][0]
+        ts = res.get("timestamp", [])
+        q = res.get("indicators", {}).get("quote", [{}])[0]
+        if ts and "close" in q:
+            df = pd.DataFrame({"time": pd.to_datetime(ts, unit="s"),
+                               "o": q.get("open", []), "h": q.get("high", []),
+                               "l": q.get("low", []),  "close": q.get("close", []),
+                               "v": q.get("volume", [])})
+            df = df.dropna(subset=["time"]).set_index("time").sort_index()
+            if not df.empty:
+                return _normalize_ohlcv(df)
+    except Exception:
+        pass
+
+    # ---------- 5) Stooq (direct) ----------
     try:
         stooq_sym = f"{symbol.lower()}.us"
         url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
-        stooq = pd.read_csv(url)
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        stooq = pd.read_csv(StringIO(r.text))
         if not stooq.empty:
-            stooq.rename(
-                columns={"Date": "time", "Open": "o", "High": "h", "Low": "l",
-                         "Close": "close", "Volume": "v"},
-                inplace=True,
-            )
+            stooq.rename(columns={"Date": "time", "Open": "o", "High": "h", "Low": "l", "Close": "close", "Volume": "v"}, inplace=True)
             stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce", utc=True).dt.tz_localize(None)
             stooq = stooq.dropna(subset=["time"]).set_index("time").sort_index()
-            cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize()
-                      - pd.Timedelta(days=days + 5))
+            cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=days + 5))
             try:
                 stooq.index = pd.DatetimeIndex(stooq.index).tz_localize(None)
                 stooq = stooq.loc[stooq.index >= cutoff]
             except Exception:
                 stooq = stooq.tail(days + 5)
             if not stooq.empty:
-                return stooq[["o", "h", "l", "close", "v"]]
-    except Exception as e:
-        raise RuntimeError(f"No history for {symbol}: Stooq failed: {e}")
+                return _normalize_ohlcv(stooq)
+    except Exception:
+        pass
 
-    # ---------- If nothing worked ----------
-    raise RuntimeError(f"No history for {symbol}: Finnhub/Yahoo/Stooq returned no data")
+    # ---------- 5b) Stooq via mirror ----------
+    try:
+        stooq_sym = f"{symbol.lower()}.us"
+        mirror = "https://r.jina.ai/http://stooq.com/q/d/l/"
+        r = requests.get(mirror, params={"s": stooq_sym, "i": "d"}, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        stooq = pd.read_csv(StringIO(r.text))
+        if not stooq.empty:
+            stooq.rename(columns={"Date": "time", "Open": "o", "High": "h", "Low": "l", "Close": "close", "Volume": "v"}, inplace=True)
+            stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce", utc=True).dt.tz_localize(None)
+            stooq = stooq.dropna(subset=["time"]).set_index("time").sort_index()
+            cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize() - pd.Timedelta(days=days + 5))
+            try:
+                stooq.index = pd.DatetimeIndex(stooq.index).tz_localize(None)
+                stooq = stooq.loc[stooq.index >= cutoff]
+            except Exception:
+                stooq = stooq.tail(days + 5)
+            if not stooq.empty:
+                return _normalize_ohlcv(stooq)
+    except Exception as e:
+        raise RuntimeError(f"No history for {symbol}: Stooq (mirror) failed: {e}")
+
+    # ---------- none worked ----------
+    raise RuntimeError(f"No history for {symbol}: all sources blocked/empty")
 
 
 
