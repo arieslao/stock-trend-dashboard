@@ -3,6 +3,7 @@ import os, sys, json, time, requests
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from pathlib import Path
+import pickle
 
 # --- CNN-LSTM / scaling ---
 import numpy as np
@@ -130,61 +131,88 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
 @st.cache_resource
 def load_cnn_lstm(symbol: str):
     """
-    Try to load a per-symbol CNN-LSTM model first (models/<SYMBOL>_cnn_lstm.h5),
-    otherwise load a generic fallback (models/cnn_lstm_generic.h5).
-    Returns a compiled keras.Model or None if nothing is available.
+    Try multiple filenames/locations and support both .keras and .h5.
+    Returns a tf.keras.Model or None.
     """
-    models_dir = Path("models")
-    sym_path = models_dir / f"{symbol.upper()}_cnn_lstm.h5"
-    gen_path = models_dir / "cnn_lstm_generic.h5"
-
-    for p in (sym_path, gen_path):
+    candidates = [
+        Path("models") / f"{symbol.upper()}_cnn_lstm.h5",
+        Path("models") / f"{symbol.upper()}_cnn_lstm.keras",
+        Path("models") / "cnn_lstm_generic.h5",
+        Path("models") / "cnn_lstm_generic.keras",
+        Path("models") / "cnn_lstm_ALL.h5",
+        Path("models") / "cnn_lstm_ALL.keras",
+        Path("cnn_lstm_ALL.h5"),      # if someone put it at repo root
+        Path("cnn_lstm_ALL.keras"),
+    ]
+    for p in candidates:
         if p.exists():
             try:
                 model = tf.keras.models.load_model(p)
+                st.session_state["cnn_model_path"] = str(p)
                 return model
             except Exception as e:
-                st.warning(f"Couldn't load {p.name}: {e}")
-
-    # Nothing found: let the caller fall back to Linear
-    st.info("No CNN-LSTM model file found in /models. Falling back to Linear.")
+                st.warning(f"Found {p.name} but failed to load: {e}")
+                # try the next candidate
+    st.info("CNN-LSTM model file not found; using Linear model instead.")
     return None
 
+
+@st.cache_resource
+def load_scaler(symbol: str):
+    """
+    Looks for a per-symbol scaler, then global scaler.
+    Returns a fitted scaler or None (we’ll create one on the fly if missing).
+    """
+    candidates = [
+        Path("models") / f"scaler_{symbol.upper()}.pkl",
+        Path("models") / "scaler_ALL.pkl",
+        Path("scaler_ALL.pkl"),       # if at repo root
+        Path("models") / "scaler.pkl",
+        Path("scaler.pkl"),
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                with open(p, "rb") as f:
+                    return pickle.load(f)
+            except Exception as e:
+                st.warning(f"Found {p.name} but failed to load scaler: {e}")
+    return None
 
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = 60):
     """
-    Assumes CNN-LSTM was trained on a single feature "close" scaled to [0,1]
-    with sequence length 'lookback'. Returns a float predicted close or None.
+    Assumes model trained on single feature 'close' scaled via MinMax.
+    Returns a float predicted next close, or None on failure.
     """
     model = load_cnn_lstm(symbol)
-    if model is None:
+    if model is None or df is None or len(df) < lookback + 1:
         return None
 
-    # We need at least lookback points
-    if len(df_prices) < lookback + 1:
-        st.info(f"Not enough history for CNN-LSTM (need ≥ {lookback+1}, have {len(df_prices)}).")
-        return None
+    series = df["close"].values.reshape(-1, 1)
 
-    # Use only the 'close' column for the network
-    closes = df_prices["close"].astype(float).values.reshape(-1, 1)
+    scaler = load_scaler(symbol)
+    if scaler is None:
+        # Fall back: fit a new scaler on the history (not ideal for strict backtests,
+        # but fine for live prediction when a saved scaler isn’t provided)
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        scaler.fit(series)
 
-    # Scale
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(closes)   # NOTE: Assumes same scaling as training
-
-    # Build last sequence of length `lookback`
-    last_seq = scaled[-lookback:]                      # shape (lookback, 1)
-    X = last_seq.reshape(1, lookback, 1)               # shape (1, lookback, features)
-
-    # Predict scaled close, then inverse
     try:
-        y_scaled_pred = model.predict(X, verbose=0)[0][0]
-        y_pred = scaler.inverse_transform([[y_scaled_pred]])[0][0]
-        return float(y_pred)
-    except Exception as e:
-        st.warning(f"CNN-LSTM inference failed: {e}")
-        return None
+        scaled = scaler.transform(series)
+    except Exception:
+        # If the scaler expects a different shape or range, refit gracefully
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        scaler.fit(series)
+        scaled = scaler.transform(series)
+
+    X = np.array([scaled[-lookback:]])   # shape (1, lookback, 1)
+    y_scaled = model.predict(X, verbose=0)[0, 0]
+    next_close = float(scaler.inverse_transform([[y_scaled]])[0, 0])
+    return next_close
+
 
 
 # ---------- Feature engineering + model ----------
@@ -275,6 +303,9 @@ with st.expander("🛠️ Diagnostics", expanded=False):
                 st.dataframe(df_debug.tail())
             except Exception as e:
                 st.error(f"History test failed: {e}")
+with st.expander("🔎 CNN-LSTM status", expanded=False):
+    st.write("Model file:", st.session_state.get("cnn_model_path"))
+
 
 
 # ---------- Focus symbol KPIs & Chart ----------
