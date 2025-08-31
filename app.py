@@ -2,7 +2,7 @@
 import os, sys, json, time, requests
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-
+from pathlib import Path
 
 # --- CNN-LSTM / scaling ---
 import numpy as np
@@ -127,32 +127,35 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
 
 
 # ---------- CNN-LSTM helpers ----------
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def load_cnn_lstm(symbol: str):
     """
-    Try to load a symbol-specific model, else a generic one.
-    Looks for:
-      models/{SYMBOL}_cnn_lstm.h5   (e.g., models/AAPL_cnn_lstm.h5)
-      models/cnn_lstm_generic.h5
-    Returns: keras model or None if not found.
+    Try to load a per-symbol CNN-LSTM model first (models/<SYMBOL>_cnn_lstm.h5),
+    otherwise load a generic fallback (models/cnn_lstm_generic.h5).
+    Returns a compiled keras.Model or None if nothing is available.
     """
-    sym_path = Path("models") / f"{symbol.upper()}_cnn_lstm.h5"
-    gen_path = Path("models") / "cnn_lstm_generic.h5"
-    try:
-        if sym_path.exists():
-            return load_model(sym_path)
-        if gen_path.exists():
-            return load_model(gen_path)
-    except Exception as e:
-        st.warning(f"Could not load CNN-LSTM model: {e}")
+    models_dir = Path("models")
+    sym_path = models_dir / f"{symbol.upper()}_cnn_lstm.h5"
+    gen_path = models_dir / "cnn_lstm_generic.h5"
+
+    for p in (sym_path, gen_path):
+        if p.exists():
+            try:
+                model = tf.keras.models.load_model(p)
+                return model
+            except Exception as e:
+                st.warning(f"Couldn't load {p.name}: {e}")
+
+    # Nothing found: let the caller fall back to Linear
+    st.info("No CNN-LSTM model file found in /models. Falling back to Linear.")
     return None
 
 
-def predict_next_close_cnnlstm(symbol: str, df_prices: pd.DataFrame, lookback: int = 60) -> float | None:
+
+def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = 60):
     """
-    Use a pre-trained CNN-LSTM to predict the next close from historical closes.
-    Assumes the model was trained on a single feature: 'close', MinMaxScaled to [0,1],
-    with sequence length = `lookback`. Returns a float predicted close or None.
+    Assumes CNN-LSTM was trained on a single feature "close" scaled to [0,1]
+    with sequence length 'lookback'. Returns a float predicted close or None.
     """
     model = load_cnn_lstm(symbol)
     if model is None:
