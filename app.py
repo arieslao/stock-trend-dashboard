@@ -6,6 +6,7 @@ WINDOWS_PT = [dtime(6, 30), dtime(12, 0)]
 
 from zoneinfo import ZoneInfo
 
+import sys
 import pandas as pd
 import numpy as np
 import streamlit as st
