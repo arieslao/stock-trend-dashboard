@@ -22,6 +22,11 @@ import streamlit as st
 import plotly.express as px
 from sklearn.linear_model import LinearRegression
 
+import joblib
+
+FEATURE_COLS = ["open", "high", "low", "close", "volume"]
+CLOSE_IDX = FEATURE_COLS.index("close")  # 3
+DEFAULT_LOOKBACK = 60 #sequence length for CNN-LSTM
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
@@ -134,99 +139,115 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
 
 
 # ---------- CNN-LSTM helpers ----------
-@st.cache_resource
-def load_cnn_lstm(symbol: str):
-    """
-    Try multiple filenames/locations and support both .keras and .h5.
-    Returns a tf.keras.Model or None.
-    """
-    if tf is None:
-        st.warning("TensorFlow is not available in this runtime; using Linear model instead.")
-        return None
 
-    from pathlib import Path
-
-    candidates = [
-        Path("models") / f"{symbol.upper()}_cnn_lstm.keras",
-        Path("models") / f"{symbol.upper()}_cnn_lstm.h5",
-        Path("models") / "cnn_lstm_ALL.keras",   # <--- your file
-        Path("models") / "cnn_lstm_ALL.h5",
-        Path("models") / "cnn_lstm_generic.keras",
-        Path("models") / "cnn_lstm_generic.h5",
-        Path("cnn_lstm_ALL.keras"),
-        Path("cnn_lstm_ALL.h5"),
-    ]
+@st.cache_resource(show_spinner=False)
+def load_cnn_lstm(symbol: str | None = None):
+    """
+    Loads a .keras model from /models. Prefers per-symbol, falls back to generic.
+    """
+    candidates = []
+    if symbol:
+        candidates.append(Path("models") / f"{symbol.upper()}_cnn_lstm.keras")
+    candidates.append(Path("models") / "cnn_lstm_ALL.keras")
     for p in candidates:
         if p.exists():
             try:
-                # compile=False is fine for inference; prevents missing loss/optimizer errors
-                model = tf.keras.models.load_model(p, compile=False)
-                st.session_state["cnn_model_path"] = str(p)
-                return model
+                return tf.keras.models.load_model(p)
             except Exception as e:
-                st.warning(f"Found {p.name} but failed to load: {e}")
-                # Try next candidate
-
-    st.info("CNN-LSTM model file not found; using Linear model instead.")
+                st.warning(f"Found {p.name} but failed to load model: {e}")
     return None
 
 
 
-@st.cache_resource
-def load_scaler(symbol: str):
+
+@st.cache_resource(show_spinner=False)
+def load_scaler():
     """
-    Looks for a per-symbol scaler, then global scaler.
-    Returns a fitted scaler or None (we’ll create one on the fly if missing).
+    Loads the 5-feature MinMaxScaler trained offline (models/scaler_ALL.pkl).
+    Returns None if missing.
     """
     candidates = [
-        Path("models") / f"scaler_{symbol.upper()}.pkl",
         Path("models") / "scaler_ALL.pkl",
-        Path("scaler_ALL.pkl"),       # if at repo root
         Path("models") / "scaler.pkl",
+        Path("scaler_ALL.pkl"),
         Path("scaler.pkl"),
     ]
     for p in candidates:
         if p.exists():
             try:
-                with open(p, "rb") as f:
-                    return pickle.load(f)
+                return joblib.load(p)
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
 
 
-def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = 60):
+def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
     """
-    Assumes model trained on single feature 'close' scaled via MinMax.
-    Returns a float predicted next close, or None on failure.
+    Build a (1, lookback, 5) tensor from the last `lookback` rows of OHLCV.
+    Uses the offline MinMaxScaler (fit on same 5-feature space).
+    Returns (X, last_close) or (None, None) if not enough data or scaler missing.
+    """
+    scaler = load_scaler()
+    if scaler is None:
+        st.warning("Scaler not found (models/scaler_ALL.pkl).")
+        return None, None
+
+    # Ensure we have the features in the right order & enough rows
+    if not set(FEATURE_COLS).issubset(df.columns):
+        st.warning("Dataframe missing one or more OHLCV columns.")
+        return None, None
+
+    if len(df) < lookback:
+        return None, None
+
+    block = df[FEATURE_COLS].tail(lookback).copy()
+    last_close = float(block["close"].iloc[-1])
+
+    # Scale using the prefit scaler
+    try:
+        scaled = scaler.transform(block.values)  # shape (lookback, 5)
+    except Exception as e:
+        st.warning(f"Scaler.transform failed: {e}")
+        return None, None
+
+    # Shape for Keras: (1, timesteps, features)
+    X = scaled[np.newaxis, :, :]  # (1, lookback, 5)
+    return X, last_close
+
+
+def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
+    """
+    Predict next close using CNN-LSTM trained on 5 features (OHLCV).
+    Model outputs a scaled 'close'; we inverse_transform just that slot.
+    Returns a float price or None.
     """
     model = load_cnn_lstm(symbol)
-    if model is None or df is None or len(df) < lookback + 1:
+    if model is None:
+        st.info("CNN-LSTM model unavailable; using fallback.")
         return None
 
-    series = df["close"].values.reshape(-1, 1)
+    X, _ = make_cnnlstm_input(df, lookback=lookback)
+    if X is None:
+        return None
 
-    scaler = load_scaler(symbol)
-    if scaler is None:
-        # Fall back: fit a new scaler on the history (not ideal for strict backtests,
-        # but fine for live prediction when a saved scaler isn’t provided)
-        from sklearn.preprocessing import MinMaxScaler
-        scaler = MinMaxScaler()
-        scaler.fit(series)
-
+    # Predict scaled close
     try:
-        scaled = scaler.transform(series)
-    except Exception:
-        # If the scaler expects a different shape or range, refit gracefully
-        from sklearn.preprocessing import MinMaxScaler
-        scaler = MinMaxScaler()
-        scaler.fit(series)
-        scaled = scaler.transform(series)
+        y_scaled = float(model.predict(X, verbose=0)[0][0])
+    except Exception as e:
+        st.warning(f"CNN-LSTM predict failed: {e}")
+        return None
 
-    X = np.array([scaled[-lookback:]])   # shape (1, lookback, 1)
-    y_scaled = model.predict(X, verbose=0)[0, 0]
-    next_close = float(scaler.inverse_transform([[y_scaled]])[0, 0])
-    return next_close
+    # Inverse scale the 'close' only
+    scaler = load_scaler()
+    dummy = np.zeros((1, len(FEATURE_COLS)))
+    dummy[0, CLOSE_IDX] = y_scaled
+    try:
+        unscaled = scaler.inverse_transform(dummy)[0, CLOSE_IDX]
+        return float(unscaled)
+    except Exception as e:
+        st.warning(f"Scaler.inverse_transform failed: {e}")
+        return None
+
 
 
 
@@ -354,29 +375,42 @@ col1, col2 = st.columns([3, 1])
 
 with col1:
     if df is not None and not df.empty:
-        # Always build features so we can show MA10/MA50 on the chart
-        feat = featurize(df)
+        # Compute MAs for overlay
+        df_plot = df.copy()
+        df_plot["MA10"] = df_plot["close"].rolling(10).mean()
+        df_plot["MA50"] = df_plot["close"].rolling(50).mean()
 
-        # ---- choose model for the focus symbol ----
-        next_price = None
-        if model_choice.startswith("CNN"):
-            next_price = predict_next_close_cnnlstm(symbol, df, lookback=60)
-            if next_price is None:
-                # graceful fallback
-                _, next_price = fit_and_predict(feat)
-                st.info("CNN-LSTM unavailable; fell back to Linear model.")
-        else:
-            _, next_price = fit_and_predict(feat)
+        fig = go.Figure()
 
-        pct_change = 100.0 * (next_price - df["close"].iloc[-1]) / df["close"].iloc[-1]
-
-        # Chart recent closes + MA10/MA50
-        line = px.line(df.reset_index(), x="time", y="close", title=f"{symbol} Close Price")
-        line.add_scatter(x=feat.index, y=feat["MA10"], mode="lines", name="MA10")
-        line.add_scatter(x=feat.index, y=feat["MA50"], mode="lines", name="MA50")
-        st.plotly_chart(line, use_container_width=True)
+        fig.add_trace(go.Candlestick(
+            x=df_plot.index,
+            open=df_plot["open"],
+            high=df_plot["high"],
+            low=df_plot["low"],
+            close=df_plot["close"],
+            name=f"{symbol} OHLC"
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_plot.index, y=df_plot["MA10"],
+            mode="lines", name="MA10"
+        ))
+        fig.add_trace(go.Scatter(
+            x=df_plot.index, y=df_plot["MA50"],
+            mode="lines", name="MA50"
+        ))
+        fig.update_layout(
+            title=f"{symbol} — Candlestick",
+            xaxis_title="Time",
+            yaxis_title="Price",
+            xaxis_rangeslider_visible=False,
+            height=350,
+            margin=dict(l=10, r=10, t=40, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("No history to chart yet. Try the Diagnostics → Force one-time fetch button above.")
+        st.info("No history to chart yet. Try Diagnostics → fetch cache.")
+
+
 
 with col2:
     if (df is not None and not df.empty and
