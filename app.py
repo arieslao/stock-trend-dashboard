@@ -319,6 +319,18 @@ with st.expander("🧪 Diagnostics", expanded=False):
         except Exception:
             st.write("Service account present.")
 
+# inside the Diagnostics expander for a "Force Fetch Now" capability outside of the 2 windows
+if st.button("Force one-time LIVE fetch & cache for focus symbol"):
+    try:
+        df_live = _get_candles_live(focus, days=days)   # bypasses window
+        _last_good_cache()["candles"][focus] = df_live
+        price_live = _get_quote_live(focus)
+        _last_good_cache()["quotes"][focus] = price_live
+        st.success("Fetched & cached live data. Reload the page.")
+    except Exception as e:
+        st.error(f"Force fetch failed: {e}")
+# continuation of original code
+           
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("Clear cache"):
