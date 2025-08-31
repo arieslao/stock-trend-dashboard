@@ -3,7 +3,12 @@ import os, sys, json, time, requests
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+
+# --- CNN-LSTM / scaling ---
 import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import load_model
+
 import pandas as pd
 
 import streamlit as st
@@ -121,6 +126,64 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
     return df[["o", "h", "l", "close", "v"]]
 
 
+# ---------- CNN-LSTM helpers ----------
+@st.cache_resource(show_spinner=False)
+def load_cnn_lstm(symbol: str):
+    """
+    Try to load a symbol-specific model, else a generic one.
+    Looks for:
+      models/{SYMBOL}_cnn_lstm.h5   (e.g., models/AAPL_cnn_lstm.h5)
+      models/cnn_lstm_generic.h5
+    Returns: keras model or None if not found.
+    """
+    sym_path = Path("models") / f"{symbol.upper()}_cnn_lstm.h5"
+    gen_path = Path("models") / "cnn_lstm_generic.h5"
+    try:
+        if sym_path.exists():
+            return load_model(sym_path)
+        if gen_path.exists():
+            return load_model(gen_path)
+    except Exception as e:
+        st.warning(f"Could not load CNN-LSTM model: {e}")
+    return None
+
+
+def predict_next_close_cnnlstm(symbol: str, df_prices: pd.DataFrame, lookback: int = 60) -> float | None:
+    """
+    Use a pre-trained CNN-LSTM to predict the next close from historical closes.
+    Assumes the model was trained on a single feature: 'close', MinMaxScaled to [0,1],
+    with sequence length = `lookback`. Returns a float predicted close or None.
+    """
+    model = load_cnn_lstm(symbol)
+    if model is None:
+        return None
+
+    # We need at least lookback points
+    if len(df_prices) < lookback + 1:
+        st.info(f"Not enough history for CNN-LSTM (need ≥ {lookback+1}, have {len(df_prices)}).")
+        return None
+
+    # Use only the 'close' column for the network
+    closes = df_prices["close"].astype(float).values.reshape(-1, 1)
+
+    # Scale
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled = scaler.fit_transform(closes)   # NOTE: Assumes same scaling as training
+
+    # Build last sequence of length `lookback`
+    last_seq = scaled[-lookback:]                      # shape (lookback, 1)
+    X = last_seq.reshape(1, lookback, 1)               # shape (1, lookback, features)
+
+    # Predict scaled close, then inverse
+    try:
+        y_scaled_pred = model.predict(X, verbose=0)[0][0]
+        y_pred = scaler.inverse_transform([[y_scaled_pred]])[0][0]
+        return float(y_pred)
+    except Exception as e:
+        st.warning(f"CNN-LSTM inference failed: {e}")
+        return None
+
+
 # ---------- Feature engineering + model ----------
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -148,12 +211,36 @@ with st.sidebar:
     alert_pct = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.25)
     symbol = st.selectbox("Focus symbol", watchlist or default_watchlist)
 
+with st.sidebar:
+    st.subheader("Model")
+    model_choice = st.selectbox(
+        "Choose model",
+        ["Linear (MA10/MA50)", "CNN-LSTM (pretrained)"],
+        index=0,
+        help="CNN-LSTM requires a pre-trained .h5 in /models."
+    )
+    
     # Helper message about windows
     mins = seconds_until_next_window() // 60
     if in_window():
         st.success("✅ Inside fetch window (Pacific Time). Live pulls allowed.")
     else:
         st.info(f"🕰️ Outside fetch window. Using cached data if available. Next window opens in ~{mins} min (Pacific).")
+# --- Model selector (Sidebar) ---
+MODEL_LINEAR = "Linear (MA10/MA50)"
+MODEL_CNN    = "CNN-LSTM (pretrained)"
+
+st.markdown("### Model")
+model_choice = st.selectbox(
+    "Choose model",
+    (MODEL_LINEAR, MODEL_CNN),
+    index=0,
+    key="model_choice",
+    help="Linear is fast and simple. CNN-LSTM uses a pretrained deep model."
+)
+
+def using_cnn() -> bool:
+    return st.session_state.get("model_choice", model_choice) == MODEL_CNN
 
 
 # ---------- Diagnostics ----------
@@ -218,10 +305,23 @@ col1, col2 = st.columns([3, 1])
 
 with col1:
     if df is not None and not df.empty:
+        # Always build features so we can show MA10/MA50 on the chart
         feat = featurize(df)
-        model, next_price = fit_and_predict(feat)
+
+        # ---- choose model for the focus symbol ----
+        next_price = None
+        if model_choice.startswith("CNN"):
+            next_price = predict_next_close_cnnlstm(symbol, df, lookback=60)
+            if next_price is None:
+                # graceful fallback
+                _, next_price = fit_and_predict(feat)
+                st.info("CNN-LSTM unavailable; fell back to Linear model.")
+        else:
+            _, next_price = fit_and_predict(feat)
+
         pct_change = 100.0 * (next_price - df["close"].iloc[-1]) / df["close"].iloc[-1]
 
+        # Chart recent closes + MA10/MA50
         line = px.line(df.reset_index(), x="time", y="close", title=f"{symbol} Close Price")
         line.add_scatter(x=feat.index, y=feat["MA10"], mode="lines", name="MA10")
         line.add_scatter(x=feat.index, y=feat["MA50"], mode="lines", name="MA50")
@@ -230,8 +330,9 @@ with col1:
         st.info("No history to chart yet. Try the Diagnostics → Force one-time fetch button above.")
 
 with col2:
-    if df is not None and not df.empty:
-        st.metric("Predicted next close", f"{next_price:,.2f}", f"{pct_change:+.2f}% vs last")
+    if (df is not None and not df.empty and
+        "next_price" in locals() and next_price is not None):
+        st.metric("Predicted next close", f"{next_price:.2f}", f"{pct_change:+.2f}% vs last")
         if pct_change >= alert_pct:
             st.success(f"Potential BUY momentum (≥ {alert_pct}%).")
         elif pct_change <= -alert_pct:
@@ -242,27 +343,56 @@ with col2:
         st.metric("Predicted next close", "—")
 
 
+
 # ---------- Watchlist table ----------
 rows = []
-for s in watchlist:
-    try:
-        # Use cache if available
-        d = None
-        if "history_cache" in st.session_state and s in st.session_state["history_cache"]:
-            d = st.session_state["history_cache"][s]
-        if d is None:
-            d = get_candles(s, days=days)  # respects window; may raise
-        f = featurize(d)
-        _, nxt = fit_and_predict(f)
-        last_close = d["close"].iloc[-1]
-        ret = 100.0 * (nxt - last_close) / last_close
-        signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
-        rows.append({"Symbol": s, "Last": round(last_close, 2), "Predicted(1d)": round(nxt, 2),
-                     "Δ%(1d)": round(ret, 2), "Signal": signal})
-    except Exception:
-        rows.append({"Symbol": s, "Last": None, "Predicted(1d)": None, "Δ%(1d)": None, "Signal": "ERR"})
+with st.spinner("Scoring watchlist…"):
+    for s in watchlist:
+        try:
+            d = get_candles(s, days=days)  # cached; respects your fetch windows
+            if d is None or d.empty:
+                raise RuntimeError("no history")
+
+            last_close = float(d["close"].iloc[-1])
+
+            # Choose model per the selector
+            model_used = "Linear"
+            next_pred = None
+
+            if model_choice.startswith("CNN"):
+                next_pred = predict_next_close_cnnlstm(s, d, lookback=60)
+                if next_pred is not None:
+                    model_used = "CNN-LSTM"
+                else:
+                    # graceful fallback to Linear for this row
+                    feat_row = featurize(d)
+                    _, next_pred = fit_and_predict(feat_row)
+                    model_used = "Linear (fallback)"
+            else:
+                feat_row = featurize(d)
+                _, next_pred = fit_and_predict(feat_row)
+
+            # Compute return & signal
+            ret = 100.0 * (next_pred - last_close) / last_close
+            signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
+
+            rows.append({
+                "Symbol": s,
+                "Last": round(last_close, 2),
+                "Predicted": round(float(next_pred), 2),
+                "Δ%": round(float(ret), 2),
+                "Signal": signal,
+                "Model": model_used
+            })
+        except Exception:
+            rows.append({
+                "Symbol": s,
+                "Last": None, "Predicted": None, "Δ%": None,
+                "Signal": "ERR", "Model": "—"
+            })
 
 if rows:
-    table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%(1d)", ascending=False)
-    st.subheader("Watchlist signals (1-day)")
+    table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False)
+    st.subheader("Watchlist signals")
     st.dataframe(table, use_container_width=True)
+
