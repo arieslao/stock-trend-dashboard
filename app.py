@@ -24,6 +24,8 @@ except Exception:
     tf = None
 
 import gspread
+from gspread.utils import rowcol_to_a1
+
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
@@ -221,27 +223,89 @@ def get_ws():
         ws.update("A1", [wanted])
     return ws
 
+
+def _ensure_sheet_header(ws):
+    """Ensure the sheet has all the columns we expect (add if missing)."""
+    wanted = [
+        "timestamp_utc", "date_utc", "symbol", "horizon",
+        "last_close", "predicted", "pct_change", "signal", "scope",
+        "model_kind", "params_json", "train_window", "features",
+        "actual", "err", "pct_err", "direction_correct",
+        "key"  # unique key per (symbol, horizon, date)
+    ]
+    header = ws.row_values(1)
+    if not header:
+        ws.append_row(wanted)
+        header = wanted[:]
+    else:
+        changed = False
+        for col in wanted:
+            if col not in header:
+                header.append(col)
+                changed = True
+        if changed:
+            ws.update("1:1", [header])
+    return header
+
+
 def log_prediction(
     symbol,
-    horizon,           # "1d","3d"...
+    horizon,          # "1d", "3d", "1w", etc.
     last_close,
     predicted,
-    pct_change,
-    signal,            # BUY/SELL/HOLD
-    scope,             # "focus" or "watchlist"
+    pct_change,       # BUY/SELL threshold math you already compute
+    signal,           # "BUY" / "SELL" / "HOLD"
+    scope,            # "focus" or "watchlist"
     model_kind,
     params,
     train_window,
     features_desc,
 ):
+    """
+    Upsert exactly one row per (symbol, horizon, UTC date).
+    If today's row exists, update it; else append a new one.
+    """
     ws = get_ws()
-    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    ws.append_row([
-        ts, symbol, horizon, float(last_close), float(predicted),
-        float(pct_change), signal, scope, model_kind, json.dumps(params),
-        int(train_window) if train_window is not None else None, features_desc,
-        "", "", "", ""  # actuals filled by reconcile
-    ])
+    header = _ensure_sheet_header(ws)
+    col_index = {name: i + 1 for i, name in enumerate(header)}
+
+    now = datetime.utcnow()
+    date_str = now.strftime("%Y-%m-%d")
+    daily_key = f"{symbol}|{horizon}|{date_str}"
+
+    # Find an existing row by 'key' (includes header in row 1)
+    key_vals = ws.col_values(col_index["key"])
+    try:
+        row_idx = key_vals.index(daily_key) + 1  # 1-based
+    except ValueError:
+        row_idx = None
+
+    # Build a row mapped to current header order
+    row_map = {
+        "timestamp_utc": now.isoformat(timespec="seconds") + "Z",
+        "date_utc": date_str,
+        "symbol": symbol,
+        "horizon": horizon,
+        "last_close": float(last_close) if last_close is not None else "",
+        "predicted": float(predicted) if predicted is not None else "",
+        "pct_change": float(pct_change) if pct_change is not None else "",
+        "signal": signal,
+        "scope": scope,
+        "model_kind": model_kind,
+        "params_json": json.dumps(params) if isinstance(params, (dict, list)) else str(params),
+        "train_window": int(train_window) if train_window is not None else "",
+        "features": features_desc,
+        "actual": "", "err": "", "pct_err": "", "direction_correct": "",
+        "key": daily_key,
+    }
+    row_list = [row_map.get(col, "") for col in header]
+
+    if row_idx:  # update in place
+        end_cell = rowcol_to_a1(row_idx, len(header))
+        ws.update(f"A{row_idx}:{end_cell}", [row_list], value_input_option="USER_ENTERED")
+    else:        # append new
+        ws.append_row(row_list, value_input_option="USER_ENTERED")
+
 
 # ---------- CNN-LSTM Loader & Predictor ----------
 @st.cache_resource
