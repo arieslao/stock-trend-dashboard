@@ -1,13 +1,15 @@
 # app.py
-import os, time, json, sys, requests
-from io import StringIO
-from datetime import datetime, timedelta, time as dtime
+import os, time, json, requests
+from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-from sklearn.linear_model import LinearRegression
+import numpy as np
 import streamlit as st
 import plotly.express as px
 import gspread
+
 
 # ---------------- Page setup ----------------
 st.set_page_config(page_title="AI-Powered Stock Trend Dashboard", layout="wide")
@@ -347,13 +349,79 @@ if st.button("Force one-time LIVE fetch & cache for focus symbol"):
             except Exception as e:
                 st.error(f"Failed to write: {e}")
 
-    with c3:
-        if st.button("Test history fetch (AAPL, 30d)"):
-            try:
-                df_test = _get_candles_live("AAPL", days=30)
-                st.success(f"Fetched {len(df_test)} rows via live pipeline.")
-            except Exception as e:
-                st.error(str(e))
+#--------- commenting this section out to print out the HTML status for troubleshooting-----
+   # with c3:
+    #    if st.button("Test history fetch (AAPL, 30d)"):
+     #       try:
+      #          df_test = _get_candles_live("AAPL", days=30)
+       #         st.success(f"Fetched {len(df_test)} rows via live pipeline.")
+        #    except Exception as e:
+         #       st.error(str(e))
+#---------- Replacing it with the below script for testing, might consider reinstating the above after fixing---------
+
+if st.button("Test history fetch (AAPL, 30d)"):
+    import requests, time
+    symbol = "AAPL"
+    days_to_get = 30
+
+    st.write("### Live history debug (bypasses windows)")
+    st.caption("Shows HTTP status and first ~160 chars of the body to diagnose rate limits / blocks.")
+
+    # --- FINNHUB ---
+    try:
+        end = int(time.time())
+        start = end - days_to_get * 86400
+        finnhub_url = "https://finnhub.io/api/v1/stock/candle"
+        finnhub_params = {
+            "symbol": symbol,
+            "resolution": "D",
+            "from": start,
+            "to": end,
+            "token": API_KEY,   # assumes you've defined API_KEY already
+        }
+        r = requests.get(finnhub_url, params=finnhub_params, timeout=15)
+        st.write("**Finnhub** status:", r.status_code)
+        st.write("Finnhub head:", r.text[:160])
+        r.raise_for_status()
+        j = r.json()
+        if j.get("s") == "ok":
+            st.success(f"Finnhub OK — bars: {len(j.get('t', []))}")
+        else:
+            st.warning(f"Finnhub returned s='{j.get('s')}'")
+    except Exception as e:
+        st.error(f"Finnhub error: {e}")
+
+    # --- YAHOO CHART ---
+    try:
+        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        yahoo_params = {"interval": "1d", "range": f"{days_to_get}d"}
+        # User-Agent helps reduce HTML/CF blocks
+        r = requests.get(yahoo_url, params=yahoo_params, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        st.write("**Yahoo** status:", r.status_code)
+        st.write("Yahoo head:", r.text[:160])
+        r.raise_for_status()
+        j = r.json()
+        result = j.get("chart", {}).get("result") or []
+        st.success(f"Yahoo OK — result objects: {len(result)}")
+    except Exception as e:
+        st.error(f"Yahoo error: {e}")
+
+    # --- STOOQ CSV ---
+    try:
+        stooq_url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.us&i=d"
+        r = requests.get(stooq_url, timeout=15)
+        st.write("**Stooq** status:", r.status_code)
+        st.write("Stooq head:", r.text[:160])
+        r.raise_for_status()
+        # if needed: parse CSV with pandas
+        # df = pd.read_csv(io.StringIO(r.text))
+        st.success("Stooq OK (CSV returned).")
+    except Exception as e:
+        st.error(f"Stooq error: {e}")
+
+
+
 
 # ---------------- Focus symbol area ----------------
 col1, col2 = st.columns([3, 1])
