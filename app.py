@@ -64,20 +64,14 @@ def get_quote(symbol: str):
 #--------Replaced Get Candles w/ a Hardened version below--------
 @st.cache_data(ttl=120)
 def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataFrame:
-    """Return OHLCV indexed by time. Try Finnhub; on any issue, fall back to Yahoo (two ways)."""
-    # ---------- Try Finnhub ----------
+    """Return OHLCV indexed by time with multi-source fallback: Finnhub → Yahoo → Stooq."""
+    # ---------- 1) Finnhub ----------
     try:
         end = int(time.time())
         start = int((datetime.now() - timedelta(days=days)).timestamp())
         r = requests.get(
             "https://finnhub.io/api/v1/stock/candle",
-            params={
-                "symbol": symbol,
-                "resolution": resolution,  # "D" for daily
-                "from": start,
-                "to": end,
-                "token": API_KEY,
-            },
+            params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
             timeout=15,
         )
         r.raise_for_status()
@@ -90,20 +84,17 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
             df.rename(columns={"c": "close"}, inplace=True)
             df.set_index("time", inplace=True)
             return df[["o", "h", "l", "close", "v"]]
-        # if not "ok", fall through to Yahoo
     except Exception:
         pass  # fall through to Yahoo
 
-    # ---------- Yahoo fallback (with browser UA) ----------
+    # ---------- 2) Yahoo / yfinance (two tries, browser UA) ----------
     try:
         import requests as _req
         sess = _req.Session()
-        # many providers reject default python UA; this mimics a browser
         sess.headers["User-Agent"] = (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
         )
-
         interval = "1d" if resolution == "D" else "60m"
         period_days = min(max(days, 5), 365 * 2)
         tk = yf.Ticker(symbol, session=sess)
@@ -113,9 +104,8 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
             df.index.name = "time"
             return df[["o", "h", "l", "close", "v"]]
     except Exception:
-        pass  # try one more way
+        pass
 
-    # ---------- Yahoo second path (download) ----------
     try:
         import requests as _req
         sess2 = _req.Session()
@@ -134,27 +124,39 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
             group_by="ticker",
             session=sess2,
             auto_adjust=False,
-            threads=False,  # serial sometimes avoids throttling issues
+            threads=False,
         )
         if isinstance(dl, pd.DataFrame) and not dl.empty:
-            if "Adj Close" in dl.columns:  # wide form
-                # normalize to single-symbol frame if yahoo returns multi-index
-                if isinstance(dl.columns, pd.MultiIndex):
-                    dl = dl.xs(symbol, axis=1, level=0, drop_level=True)
+            if isinstance(dl.columns, pd.MultiIndex):
+                dl = dl.xs(symbol, axis=1, level=0, drop_level=True)
             df = dl.rename(columns={"Close": "close", "Open": "o", "High": "h", "Low": "l", "Volume": "v"})
             df.index.name = "time"
             return df[["o", "h", "l", "close", "v"]]
+    except Exception:
+        pass  # fall through to Stooq
+
+    # ---------- 3) Stooq CSV fallback (e.g., AAPL -> aapl.us) ----------
+    try:
+        stooq_sym = f"{symbol.lower()}.us"
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+        stooq = pd.read_csv(url)
+        if not stooq.empty:
+            stooq.rename(
+                columns={"Date": "time", "Open": "o", "High": "h", "Low": "l", "Close": "close", "Volume": "v"},
+                inplace=True,
+            )
+            stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce")
+            stooq = stooq.dropna(subset=["time"]).set_index("time").sort_index()
+            cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days + 5)
+            stooq = stooq[stooq.index >= cutoff]
+            if not stooq.empty:
+                return stooq[["o", "h", "l", "close", "v"]]
     except Exception as e:
-        raise RuntimeError(f"No history for {symbol}: {e}")
+        raise RuntimeError(f"No history for {symbol}: Stooq failed: {e}")
 
-    # If we get here, both Yahoo attempts were empty
-    raise RuntimeError(f"No history for {symbol}: Yahoo returned empty data")
+    raise RuntimeError(f"No history for {symbol}: Finnhub/Yahoo/Stooq returned no data")
 
-def featurize(df: pd.DataFrame):
-    out = df.copy()
-    out["MA10"] = out["close"].rolling(10).mean()
-    out["MA50"] = out["close"].rolling(50).mean()
-    return out.dropna()
+
 
 # ---------- Simple Targets (support/resistance/trendline) ----------
 def simple_targets(df, lookback=60):
@@ -415,6 +417,14 @@ with st.expander("🛠 Diagnostics"):
             st.success("Yahoo OK")
         except Exception as e:
             st.error(f"Yahoo failed: {e}")
+
+if st.button("Test Stooq fallback (AAPL, 30d)"):
+    try:
+        st.cache_data.clear()
+        _ = get_candles("AAPL", days=30, resolution="D")
+        st.success("Stooq OK")
+    except Exception as e:
+        st.error(f"Stooq failed: {e}")
 
 
 
