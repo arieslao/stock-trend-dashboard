@@ -136,19 +136,32 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         pass  # fall through to Stooq
 
     # ---------- 3) Stooq CSV fallback (e.g., AAPL -> aapl.us) ----------
+    
     try:
         stooq_sym = f"{symbol.lower()}.us"
         url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
         stooq = pd.read_csv(url)
+
         if not stooq.empty:
             stooq.rename(
-                columns={"Date": "time", "Open": "o", "High": "h", "Low": "l", "Close": "close", "Volume": "v"},
+                columns={"Date": "time", "Open": "o", "High": "h", "Low": "l",
+                         "Close": "close", "Volume": "v"},
                 inplace=True,
             )
-            stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce")
+
+            # make tz-naive uniformly, set index
+            stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce", utc=True).dt.tz_localize(None)
             stooq = stooq.dropna(subset=["time"]).set_index("time").sort_index()
-            cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days + 5)
-            stooq = stooq[stooq.index >= cutoff]
+
+            # build comparable (tz-naive) cutoff and filter; if it complains, just tail
+            cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize()
+                      - pd.Timedelta(days=days + 5))
+            try:
+                stooq.index = pd.DatetimeIndex(stooq.index).tz_localize(None)
+                stooq = stooq.loc[stooq.index >= cutoff]
+            except Exception:
+                stooq = stooq.tail(days + 5)
+
             if not stooq.empty:
                 return stooq[["o", "h", "l", "close", "v"]]
     except Exception as e:
