@@ -64,7 +64,9 @@ def get_quote(symbol: str):
 #--------Replaced Get Candles w/ a Hardened version below--------
 @st.cache_data(ttl=120)
 def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataFrame:
-    """Return OHLCV indexed by time with multi-source fallback: Finnhub → Yahoo → Stooq."""
+    """Return OHLCV indexed by time with multi-source fallback:
+       Finnhub → yfinance(history) → yfinance(download) → Yahoo Chart JSON → Stooq.
+    """
     # ---------- 1) Finnhub ----------
     try:
         end = int(time.time())
@@ -72,10 +74,15 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
         r = requests.get(
             "https://finnhub.io/api/v1/stock/candle",
             params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
+            headers={"Accept": "application/json"},
             timeout=15,
         )
+        # If you’re rate limited, this is usually 403 HTML; the next line will raise for that.
         r.raise_for_status()
-        data = r.json()
+        if "application/json" in r.headers.get("content-type", ""):
+            data = r.json()
+        else:
+            raise RuntimeError(f"Finnhub non-JSON response: {r.status_code}")
         if data.get("s") == "ok" and data.get("t"):
             df = pd.DataFrame(
                 {"t": data["t"], "o": data["o"], "h": data["h"], "l": data["l"], "c": data["c"], "v": data["v"]}
@@ -133,27 +140,60 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
             df.index.name = "time"
             return df[["o", "h", "l", "close", "v"]]
     except Exception:
+        pass  # fall through to Yahoo Chart JSON
+
+    # ---------- 3) Yahoo Chart JSON (often works when yfinance is blocked) ----------
+    try:
+        import requests as _req
+        sess3 = _req.Session()
+        sess3.headers["User-Agent"] = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        )
+        end = int(time.time())
+        start = end - int(days * 86400)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {
+            "period1": start,
+            "period2": end,
+            "interval": "1d",
+            "includePrePost": "false",
+            "events": "div,splits",
+        }
+        r = sess3.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        res = j["chart"]["result"][0]
+        ts = res.get("timestamp", [])
+        q = res.get("indicators", {}).get("quote", [{}])[0]
+        if ts and "close" in q:
+            df = pd.DataFrame(
+                {"time": pd.to_datetime(ts, unit="s"),
+                 "o": q.get("open", []),
+                 "h": q.get("high", []),
+                 "l": q.get("low", []),
+                 "close": q.get("close", []),
+                 "v": q.get("volume", []),}
+            )
+            df = df.dropna(subset=["time"]).set_index("time").sort_index()
+            if not df.empty:
+                return df[["o", "h", "l", "close", "v"]]
+    except Exception:
         pass  # fall through to Stooq
 
-    # ---------- 3) Stooq CSV fallback (e.g., AAPL -> aapl.us) ----------
-    
+    # ---------- 4) Stooq CSV fallback (AAPL -> aapl.us) ----------
     try:
         stooq_sym = f"{symbol.lower()}.us"
         url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
         stooq = pd.read_csv(url)
-
         if not stooq.empty:
             stooq.rename(
                 columns={"Date": "time", "Open": "o", "High": "h", "Low": "l",
                          "Close": "close", "Volume": "v"},
                 inplace=True,
             )
-
-            # make tz-naive uniformly, set index
             stooq["time"] = pd.to_datetime(stooq["time"], errors="coerce", utc=True).dt.tz_localize(None)
             stooq = stooq.dropna(subset=["time"]).set_index("time").sort_index()
-
-            # build comparable (tz-naive) cutoff and filter; if it complains, just tail
             cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize()
                       - pd.Timedelta(days=days + 5))
             try:
@@ -161,12 +201,12 @@ def get_candles(symbol: str, days: int = 180, resolution: str = "D") -> pd.DataF
                 stooq = stooq.loc[stooq.index >= cutoff]
             except Exception:
                 stooq = stooq.tail(days + 5)
-
             if not stooq.empty:
                 return stooq[["o", "h", "l", "close", "v"]]
     except Exception as e:
         raise RuntimeError(f"No history for {symbol}: Stooq failed: {e}")
 
+    # ---------- If nothing worked ----------
     raise RuntimeError(f"No history for {symbol}: Finnhub/Yahoo/Stooq returned no data")
 
 
