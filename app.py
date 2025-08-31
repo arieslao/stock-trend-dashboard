@@ -1,7 +1,9 @@
 # app.py
 import os, time, json, requests
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
+WINDOWS_PT = [dtime(6, 30), dtime(12, 0)]
+
 from zoneinfo import ZoneInfo
 
 import pandas as pd
