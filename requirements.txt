@@ -10,5 +10,11 @@ requests==2.32.3
 gspread==6.0.2
 google-auth==2.31.0
 
+#TensorFlow dependencies
+tensorflow-cpu==2.15.0
+protobuf<4.25.0          # avoids known TF/Protobuf import clash
+h5py>=3.8                # Keras sometimes needs this for model I/O
+pandas-ta
+
 # Timezone data for zoneinfo on some platforms
 tzdata>=2023.3
