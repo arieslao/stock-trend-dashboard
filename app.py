@@ -26,6 +26,116 @@ FEATURE_COLS = ["open", "high", "low", "close", "volume"]
 CLOSE_IDX = FEATURE_COLS.index("close")  # 3
 DEFAULT_LOOKBACK = 60  # sequence length for CNN-LSTM
 
+
+# Columns / header for the Google Sheet
+LOG_COLUMNS = [
+    "ts_utc", "ts_pt", "symbol", "model", "lookback",
+    "days_history", "last_close", "predicted", "pct_change",
+    "in_window", "ma10", "ma50", "note"
+]
+
+
+
+# --- logging / google sheets (safe/optional) ---
+from typing import Optional, List, Dict
+import csv
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:  # libs may not be installed
+    gspread = None
+    Credentials = None
+
+# --- google sheets helpers ---
+@st.cache_resource(show_spinner=False)
+def _get_gsheet():
+    """
+    Returns (worksheet, service_account_email) or (None, msg) if unavailable.
+    Looks in st.secrets first, then env vars:
+      - st.secrets["gcp_service_account"] (dict)
+      - st.secrets["GOOGLE_SHEETS_JSON"] (string JSON)
+      - os.environ["GOOGLE_SHEETS_JSON"]
+      - st.secrets / env: GOOGLE_SHEETS_SHEET_ID
+    """
+    if not (gspread and Credentials):
+        return None, "gspread / google-auth not installed"
+
+    # Sheet ID
+    sheet_id = (
+        st.secrets.get("GOOGLE_SHEETS_SHEET_ID")
+        if hasattr(st, "secrets") else None
+    ) or os.getenv("GOOGLE_SHEETS_SHEET_ID")
+
+    # Service account JSON (as dict)
+    creds_info = None
+    if hasattr(st, "secrets"):
+        if "gcp_service_account" in st.secrets:
+            creds_info = st.secrets["gcp_service_account"]
+        elif "GOOGLE_SHEETS_JSON" in st.secrets:
+            try:
+                creds_info = json.loads(st.secrets["GOOGLE_SHEETS_JSON"])
+            except Exception:
+                pass
+    if creds_info is None and os.getenv("GOOGLE_SHEETS_JSON"):
+        try:
+            creds_info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
+        except Exception:
+            pass
+
+    if not sheet_id:
+        return None, "Missing GOOGLE_SHEETS_SHEET_ID"
+    if not creds_info:
+        return None, "Missing service account JSON (st.secrets or env)"
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(sheet_id)
+        # Use 'logs' worksheet if present; else sheet1
+        try:
+            ws = sh.worksheet("logs")
+        except Exception:
+            ws = sh.sheet1
+        # Ensure header
+        values = ws.get_all_values()
+        if not values or (values and values[0] != LOG_COLUMNS):
+            ws.update("A1", [LOG_COLUMNS])
+        return ws, getattr(creds, "service_account_email", "service-account")
+    except Exception as e:
+        return None, f"Auth/open failed: {e}"
+
+
+def append_prediction_rows(rows: List[Dict]):
+    """
+    Append a list of row-dicts to Google Sheet.
+    Each row dict can contain keys from LOG_COLUMNS; missing keys are blank.
+    Falls back silently if sheet is unavailable.
+    """
+    ws, info = _get_gsheet()
+    if ws is None:
+        # Optionally write a local CSV as a fallback
+        # with open("pred_logs.csv", "a", newline="") as f:
+        #     w = csv.writer(f)
+        #     for r in rows:
+        #         w.writerow([r.get(k, "") for k in LOG_COLUMNS])
+        return  # no-op if sheet not configured
+
+    payload = [[r.get(k, "") for k in LOG_COLUMNS] for r in rows]
+    try:
+        ws.append_rows(payload, value_input_option="RAW")
+    except Exception as e:
+        # Silent skip; keep app behavior unchanged
+        pass
+
+
+
+
+
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
 st.title("📈 AI-Powered Stock Trend Dashboard")
@@ -336,6 +446,16 @@ with st.expander("🛠️ Diagnostics", expanded=False):
 with st.expander("🔎 CNN-LSTM status", expanded=False):
     st.write("Model file:", st.session_state.get("cnn_model_path", "None"))
 
+    # --- google sheets status  ---
+    ws, info = _get_gsheet()
+    if ws is None:
+        st.write("Google Sheets: not configured –", info)
+    else:
+        st.write("Google Sheets: connected ✅")
+        st.write("Worksheet:", ws.title)
+        st.write("Service account:", info)
+
+
 # ---------- Focus symbol KPIs & Chart ----------
 # 1) Quote
 price = None
@@ -456,6 +576,33 @@ with col2:
         if df is not None and not df.empty:
             st.caption(f"Model: {model_used}")
 
+    # --- log focus symbol (if we have a prediction) ---
+    try:
+        if df is not None and not df.empty and "next_price" in locals() and next_price is not None:
+            ma10 = df["close"].rolling(10).mean().iloc[-1] if len(df) >= 10 else ""
+            ma50 = df["close"].rolling(50).mean().iloc[-1] if len(df) >= 50 else ""
+            append_prediction_rows([
+                {
+                    "ts_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ts_pt": now_la().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": symbol,
+                    "model": ("CNN-LSTM" if using_cnn() else "Linear"),
+                    "lookback": (DEFAULT_LOOKBACK if using_cnn() else ""),
+                    "days_history": days,
+                    "last_close": float(df["close"].iloc[-1]),
+                    "predicted": float(next_price),
+                    "pct_change": float(pct_change),
+                    "in_window": in_window(),
+                    "ma10": float(ma10) if ma10 != "" else "",
+                    "ma50": float(ma50) if ma50 != "" else "",
+                    "note": "focus",
+                }
+            ])
+    except Exception:
+        pass
+
+
+
 # ---------- Watchlist table ----------
 rows = []
 with st.spinner("Scoring watchlist…"):
@@ -512,3 +659,31 @@ if rows:
     table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False)
     st.subheader("Watchlist signals")
     st.dataframe(table, use_container_width=True)
+
+    # --- log watchlist predictions ---
+    try:
+        to_log = []
+        for r in rows:
+            if r.get("Predicted") is None or r.get("Last") is None:
+                continue
+            to_log.append({
+                "ts_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts_pt": now_la().strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": r.get("Symbol", ""),
+                "model": r.get("Model", ""),
+                "lookback": (DEFAULT_LOOKBACK if "CNN" in (r.get("Model") or "") else ""),
+                "days_history": days,
+                "last_close": r.get("Last", ""),
+                "predicted": r.get("Predicted", ""),
+                "pct_change": r.get("Δ%", ""),
+                "in_window": in_window(),
+                "ma10": "",  # optional: compute if you want
+                "ma50": "",
+                "note": "watchlist",
+            })
+        if to_log:
+            append_prediction_rows(to_log)
+    except Exception:
+        pass
+
+
