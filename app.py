@@ -16,7 +16,13 @@ import joblib
 
 from sklearn.linear_model import LinearRegression
 
-import tensorflow as tf  # uses tensorflow-cpu in requirements
+#import tensorflow as tf  # uses tensorflow-cpu in requirements
+# TensorFlow is optional; if it can't install, we fall back to a linear model
+try:
+    import tensorflow as tf
+except Exception:
+    tf = None
+
 import gspread
 
 # ---------- App Config ----------
@@ -185,9 +191,12 @@ def log_prediction(
 # ---------- CNN-LSTM Loader & Predictor ----------
 @st.cache_resource
 def load_cnn_lstm():
+    if tf is None:
+        raise RuntimeError("TensorFlow is not installed in this environment.")
     mdl = tf.keras.models.load_model("models/cnn_lstm_ALL.keras", compile=False)
-    pack = joblib.load("models/scaler_ALL.pkl")  # {"scaler":..., "feats":[...]}
+    pack = joblib.load("models/scaler_ALL.pkl")
     return mdl, pack["scaler"], pack["feats"]
+
 
 def predict_cnn_lstm_for_symbol(df: pd.DataFrame, model, scaler, feats, horizons=HORIZONS, window=WINDOW):
     d = df.copy()
