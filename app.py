@@ -4,30 +4,27 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import pickle
+
 # --- Optional / safe TF import (only used if you pick the CNN-LSTM model) ---
 try:
     import tensorflow as tf  # noqa: F401
 except Exception:
     tf = None  # we’ll gracefully fall back to Linear if TF isn’t available
 
-
 # --- CNN-LSTM / scaling ---
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import load_model
-
 import pandas as pd
+import joblib
 
 import streamlit as st
-import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.linear_model import LinearRegression
 
-import joblib
 
 FEATURE_COLS = ["open", "high", "low", "close", "volume"]
 CLOSE_IDX = FEATURE_COLS.index("close")  # 3
-DEFAULT_LOOKBACK = 60 #sequence length for CNN-LSTM
+DEFAULT_LOOKBACK = 60  # sequence length for CNN-LSTM
 
 # ---------- App Config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
@@ -37,7 +34,6 @@ st.caption(
     "Model: Linear Regression with MA10/MA50. "
     "Request windows enforced (06:30 & 12:00 PT)."
 )
-
 
 # ---------- Time-window helpers (Pacific Time) ----------
 LA = ZoneInfo("America/Los_Angeles")
@@ -74,7 +70,6 @@ def seconds_until_next_window() -> int:
         candidates.append((t + timedelta(days=1)).replace(hour=w.hour, minute=w.minute, second=0, microsecond=0))
     delta = min(candidates) - t
     return max(0, int(delta.total_seconds()))
-
 
 # ---------- Yahoo fetchers (quote + candles) ----------
 YH_HEADERS = {"User-Agent": "Mozilla/5.0"}  # Yahoo requires a UA header
@@ -138,27 +133,29 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
     df.set_index("time", inplace=True)
     return df[["o", "h", "l", "close", "v"]]
 
-
 # ---------- CNN-LSTM helpers ----------
-
 @st.cache_resource(show_spinner=False)
 def load_cnn_lstm(symbol: str | None = None):
     """
     Loads a .keras model from /models. Prefers per-symbol, falls back to generic.
     """
+    if tf is None:
+        return None
+
     candidates = []
     if symbol:
         candidates.append(Path("models") / f"{symbol.upper()}_cnn_lstm.keras")
     candidates.append(Path("models") / "cnn_lstm_ALL.keras")
+
     for p in candidates:
         if p.exists():
             try:
-                return tf.keras.models.load_model(p)
+                model = tf.keras.models.load_model(p)
+                st.session_state["cnn_model_path"] = str(p)
+                return model
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load model: {e}")
     return None
-
-
 
 
 @st.cache_resource(show_spinner=False)
@@ -193,15 +190,21 @@ def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
         st.warning("Scaler not found (models/scaler_ALL.pkl).")
         return None, None
 
-    # Ensure we have the features in the right order & enough rows
-    if not set(FEATURE_COLS).issubset(df.columns):
+    # Normalize column names to open/high/low/close/volume
+    df_n = df.copy()
+    if {'o', 'h', 'l', 'close', 'v'}.issubset(df_n.columns):
+        df_n = df_n.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'})
+    elif {'Open', 'High', 'Low', 'Close'}.issubset(df_n.columns):
+        df_n = df_n.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+
+    if not set(FEATURE_COLS).issubset(df_n.columns):
         st.warning("Dataframe missing one or more OHLCV columns.")
         return None, None
 
-    if len(df) < lookback:
+    if len(df_n) < lookback:
         return None, None
 
-    block = df[FEATURE_COLS].tail(lookback).copy()
+    block = df_n[FEATURE_COLS].tail(lookback).copy()
     last_close = float(block["close"].iloc[-1])
 
     # Scale using the prefit scaler
@@ -249,12 +252,12 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
         st.warning(f"Scaler.inverse_transform failed: {e}")
         return None
 
-
-
-
 # ---------- Feature engineering + model ----------
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # Make sure we have a 'close' column
+    if 'close' not in out.columns and 'Close' in out.columns:
+        out = out.rename(columns={'Close': 'close'})
     out["MA10"] = out["close"].rolling(10).mean()
     out["MA50"] = out["close"].rolling(50).mean()
     out = out.dropna()
@@ -269,7 +272,6 @@ def fit_and_predict(df_features: pd.DataFrame) -> tuple[LinearRegression, float]
     pred = float(model.predict(last)[0])
     return model, pred
 
-
 # ---------- Sidebar / Controls ----------
 default_watchlist = ["AAPL", "MSFT", "GOOGL", "TSLA"]
 with st.sidebar:
@@ -279,37 +281,27 @@ with st.sidebar:
     alert_pct = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.25)
     symbol = st.selectbox("Focus symbol", watchlist or default_watchlist)
 
-with st.sidebar:
     st.subheader("Model")
+    MODEL_LINEAR = "Linear (MA10/MA50)"
+    MODEL_CNN    = "CNN-LSTM (pretrained)"
     model_choice = st.selectbox(
         "Choose model",
-        ["Linear (MA10/MA50)", "CNN-LSTM (pretrained)"],
+        (MODEL_LINEAR, MODEL_CNN),
         index=0,
-        help="CNN-LSTM requires a pre-trained .h5 in /models."
+        help="Linear is fast and simple. CNN-LSTM uses a pretrained deep model."
     )
-    
+    st.session_state["model_choice"] = model_choice  # keep for use later
+
     # Helper message about windows
     mins = seconds_until_next_window() // 60
     if in_window():
         st.success("✅ Inside fetch window (Pacific Time). Live pulls allowed.")
     else:
-        st.info(f"🕰️ Outside fetch window. Using cached data if available. Next window opens in ~{mins} min (Pacific).")
-# --- Model selector (Sidebar) ---
-MODEL_LINEAR = "Linear (MA10/MA50)"
-MODEL_CNN    = "CNN-LSTM (pretrained)"
-
-st.markdown("### Model")
-model_choice = st.selectbox(
-    "Choose model",
-    (MODEL_LINEAR, MODEL_CNN),
-    index=0,
-    key="model_choice",
-    help="Linear is fast and simple. CNN-LSTM uses a pretrained deep model."
-)
+        st.info(f"🕰️ Outside fetch window. Using cached data if available. "
+                f"Next window opens in ~{mins} min (Pacific).")
 
 def using_cnn() -> bool:
-    return st.session_state.get("model_choice", model_choice) == MODEL_CNN
-
+    return st.session_state.get("model_choice", "Linear (MA10/MA50)") == "CNN-LSTM (pretrained)"
 
 # ---------- Diagnostics ----------
 with st.expander("🛠️ Diagnostics", expanded=False):
@@ -340,10 +332,9 @@ with st.expander("🛠️ Diagnostics", expanded=False):
                 st.dataframe(df_debug.tail())
             except Exception as e:
                 st.error(f"History test failed: {e}")
+
 with st.expander("🔎 CNN-LSTM status", expanded=False):
-    st.write("Model file:", st.session_state.get("cnn_model_path"))
-
-
+    st.write("Model file:", st.session_state.get("cnn_model_path", "None"))
 
 # ---------- Focus symbol KPIs & Chart ----------
 # 1) Quote
@@ -374,89 +365,131 @@ if df is None:
 
 col1, col2 = st.columns([3, 1])
 
+# Prepare prediction variables
+next_price = None
+pct_change = None
+model_used = "—"
+
+if df is not None and not df.empty:
+    last_close = float(df["close"].iloc[-1])
+
+    # Choose model for the focus symbol
+    if using_cnn():
+        npred = predict_next_close_cnnlstm(symbol, df, lookback=DEFAULT_LOOKBACK)
+        if npred is not None:
+            next_price = float(npred)
+            model_used = "CNN-LSTM"
+        else:
+            # graceful fallback to Linear
+            feat = featurize(df)
+            if not feat.empty:
+                _, next_price = fit_and_predict(feat)
+                model_used = "Linear (fallback)"
+    else:
+        feat = featurize(df)
+        if not feat.empty:
+            _, next_price = fit_and_predict(feat)
+            model_used = "Linear"
+
+    if next_price is not None:
+        pct_change = 100.0 * (next_price - last_close) / last_close
+
 with col1:
     if df is not None and not df.empty:
-        # Compute MAs for overlay
+        # ---- Candlestick + MAs (robust to column name schema) ----
         df_plot = df.copy()
-        df_plot["MA10"] = df_plot["close"].rolling(10).mean()
-        df_plot["MA50"] = df_plot["close"].rolling(50).mean()
 
-        fig = go.Figure()
+        # Normalize to 'open','high','low','close','volume'
+        if {'o', 'h', 'l', 'close', 'v'}.issubset(df_plot.columns):
+            df_plot = df_plot.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'v': 'volume'})
+        elif {'Open', 'High', 'Low', 'Close'}.issubset(df_plot.columns):
+            df_plot = df_plot.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
 
-        fig.add_trace(go.Candlestick(
-            x=df_plot.index,
-            open=df_plot["open"],
-            high=df_plot["high"],
-            low=df_plot["low"],
-            close=df_plot["close"],
-            name=f"{symbol} OHLC"
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_plot.index, y=df_plot["MA10"],
-            mode="lines", name="MA10"
-        ))
-        fig.add_trace(go.Scatter(
-            x=df_plot.index, y=df_plot["MA50"],
-            mode="lines", name="MA50"
-        ))
-        fig.update_layout(
-            title=f"{symbol} — Candlestick",
-            xaxis_title="Time",
-            yaxis_title="Price",
-            xaxis_rangeslider_visible=False,
-            height=350,
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        missing = [c for c in ['open', 'high', 'low', 'close'] if c not in df_plot.columns]
+        if missing:
+            st.error(f"Data missing columns for candlestick: {missing}. Got {list(df_plot.columns)}")
+        else:
+            # Compute MAs for overlay from 'close'
+            df_plot["MA10"] = df_plot["close"].rolling(10).mean()
+            df_plot["MA50"] = df_plot["close"].rolling(50).mean()
+
+            fig = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=df_plot.index,
+                        open=df_plot["open"],
+                        high=df_plot["high"],
+                        low=df_plot["low"],
+                        close=df_plot["close"],
+                        name=f"{symbol} OHLC",
+                    )
+                ]
+            )
+            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["MA10"], name="MA10", mode="lines"))
+            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["MA50"], name="MA50", mode="lines"))
+
+            fig.update_layout(
+                xaxis_rangeslider_visible=False,
+                height=350,
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No history to chart yet. Try Diagnostics → fetch cache.")
 
-
-
 with col2:
-    if (df is not None and not df.empty and
-        "next_price" in locals() and next_price is not None):
-        st.metric("Predicted next close", f"{next_price:.2f}", f"{pct_change:+.2f}% vs last")
-        if pct_change >= alert_pct:
-            st.success(f"Potential BUY momentum (≥ {alert_pct}%).")
-        elif pct_change <= -alert_pct:
-            st.error(f"Potential SELL momentum (≤ -{alert_pct}%).")
-        else:
-            st.info("No strong signal at your threshold.")
+    if (df is not None and not df.empty and next_price is not None):
+        st.metric("Predicted next close", f"{next_price:.2f}",
+                  f"{pct_change:+.2f}% vs last" if pct_change is not None else None)
+        st.caption(f"Model: {model_used}")
+        if pct_change is not None:
+            if pct_change >= alert_pct:
+                st.success(f"Potential BUY momentum (≥ {alert_pct}%).")
+            elif pct_change <= -alert_pct:
+                st.error(f"Potential SELL momentum (≤ -{alert_pct}%).")
+            else:
+                st.info("No strong signal at your threshold.")
     else:
         st.metric("Predicted next close", "—")
-
-
+        if df is not None and not df.empty:
+            st.caption(f"Model: {model_used}")
 
 # ---------- Watchlist table ----------
 rows = []
 with st.spinner("Scoring watchlist…"):
     for s in watchlist:
         try:
-            d = get_candles(s, days=days)  # cached; respects your fetch windows
+            d = get_candles(s, days=days)  # cached; respects fetch windows
             if d is None or d.empty:
                 raise RuntimeError("no history")
 
             last_close = float(d["close"].iloc[-1])
 
             # Choose model per the selector
-            model_used = "Linear"
+            model_used_row = "Linear"
             next_pred = None
 
-            if model_choice.startswith("CNN"):
-                next_pred = predict_next_close_cnnlstm(s, d, lookback=60)
+            if using_cnn():
+                next_pred = predict_next_close_cnnlstm(s, d, lookback=DEFAULT_LOOKBACK)
                 if next_pred is not None:
-                    model_used = "CNN-LSTM"
+                    model_used_row = "CNN-LSTM"
                 else:
                     # graceful fallback to Linear for this row
                     feat_row = featurize(d)
-                    _, next_pred = fit_and_predict(feat_row)
-                    model_used = "Linear (fallback)"
+                    if not feat_row.empty:
+                        _, next_pred = fit_and_predict(feat_row)
+                        model_used_row = "Linear (fallback)"
             else:
                 feat_row = featurize(d)
-                _, next_pred = fit_and_predict(feat_row)
+                if not feat_row.empty:
+                    _, next_pred = fit_and_predict(feat_row)
 
             # Compute return & signal
+            if next_pred is None:
+                raise RuntimeError("prediction failed")
+
             ret = 100.0 * (next_pred - last_close) / last_close
             signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
 
@@ -466,7 +499,7 @@ with st.spinner("Scoring watchlist…"):
                 "Predicted": round(float(next_pred), 2),
                 "Δ%": round(float(ret), 2),
                 "Signal": signal,
-                "Model": model_used
+                "Model": model_used_row
             })
         except Exception:
             rows.append({
@@ -479,4 +512,3 @@ if rows:
     table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False)
     st.subheader("Watchlist signals")
     st.dataframe(table, use_container_width=True)
-
