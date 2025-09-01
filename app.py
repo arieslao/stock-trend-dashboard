@@ -296,25 +296,75 @@ def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
 
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
+    """
+    Predict next close with a CNN-LSTM that may have been trained on either:
+      - 5 features (open, high, low, close, volume), or
+      - 1 feature (close only)
+    We detect the expected feature count from model.input_shape[-1].
+    Returns a float or None (caller will fall back to Linear).
+    """
+    if tf is None:
+        return None
+
     model = load_cnn_lstm(symbol)
     if model is None:
         return None
-    X, _ = make_cnnlstm_input(df, lookback=lookback)
-    if X is None:
+
+    # Normalize columns
+    d = df.copy()
+    if {'o','h','l','close','v'}.issubset(d.columns):
+        d = d.rename(columns={'o':'open','h':'high','l':'low','v':'volume'})
+    elif {'Open','High','Low','Close'}.issubset(d.columns):
+        d = d.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
+
+    if 'close' not in d.columns or len(d) < lookback:
         return None
+
+    scaler = load_scaler()
+    if scaler is None:
+        return None
+
+    # How many features does the model expect?
+    try:
+        n_feats = model.input_shape[-1]
+    except Exception:
+        n_feats = len(FEATURE_COLS)  # best guess
+
+    try:
+        if n_feats == 1:
+            # Scale close-only using the close parameters of the 5-feature scaler
+            if not hasattr(scaler, "scale_") or not hasattr(scaler, "min_"):
+                return None
+            a = float(scaler.scale_[CLOSE_IDX])  # multiply
+            b = float(scaler.min_[CLOSE_IDX])    # add
+            seq = d["close"].tail(lookback).to_numpy().reshape(-1, 1)  # (L,1)
+            seq_scaled = seq * a + b                                   # (L,1)
+            X = seq_scaled[np.newaxis, :, :]                           # (1,L,1)
+        else:
+            # Assume 5 features OHLCV
+            if not set(FEATURE_COLS).issubset(d.columns):
+                return None
+            block = d[FEATURE_COLS].tail(lookback).to_numpy()          # (L,5)
+            block_scaled = scaler.transform(block)                     # (L,5)
+            X = block_scaled[np.newaxis, :, :]                         # (1,L,5)
+    except Exception:
+        return None
+
+    # Predict (scaled close)
     try:
         y_scaled = float(model.predict(X, verbose=0)[0][0])
     except Exception:
         return None
-    scaler = load_scaler()
-    if scaler is None:
-        return None
-    dummy = np.zeros((1, len(FEATURE_COLS)))
-    dummy[0, CLOSE_IDX] = y_scaled
+
+    # Inverse-scale the close using the 5-feature scaler we loaded
     try:
-        return float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+        dummy = np.zeros((1, len(FEATURE_COLS)), dtype=float)
+        dummy[0, CLOSE_IDX] = y_scaled
+        y = float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+        return y
     except Exception:
         return None
+
 
 
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
