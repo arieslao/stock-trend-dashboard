@@ -276,6 +276,7 @@ def load_cnn_lstm(symbol: Optional[str] = None):
 
 
 @st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_scaler():
     for p in [
         Path("models") / "scaler_ALL.pkl",
@@ -286,13 +287,13 @@ def load_scaler():
         if p.exists():
             try:
                 obj = joblib.load(p)
-                # unwrap common structure: {"scaler": <MinMaxScaler>, "feats": [...]}
                 if isinstance(obj, dict) and "scaler" in obj:
                     obj = obj["scaler"]
                 return obj
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
+
 
 
 # -------- Robust scaler utilities --------
@@ -490,39 +491,40 @@ if not st.session_state.get("_session_primed", False):
                 st.warning(f"Auto-prime skipped: {e}")
 
 
+
+
 # ---------- Diagnostics / Integrations ----------
 with st.expander("🔧 Diagnostics & Integrations", expanded=False):
     st.write("Now (PT):", now_la().strftime("%Y-%m-%d %H:%M:%S"))
     st.write("In window:", in_window())
     st.write("Next window (min):", seconds_until_next_window() // 60)
 
-    mdl = load_cnn_lstm()  # generic/all-symbol model
+    # Model status
+    mdl = load_cnn_lstm()
     st.write("CNN-LSTM loaded:", bool(mdl))
     if mdl:
         try:
             st.write("Model input shape:", mdl.input_shape)
-            st.write("Model expects features:", mdl.input_shape[-1])
+            st.write("Model expects features:", int(mdl.input_shape[-1]))
         except Exception:
             pass
 
-   # sc = load_scaler()
-   # st.write("Scaler loaded:", sc is not None)
-   # if isinstance(sc, dict):
-        # --- surface which keys exist so you can see what’s inside your saved scaler
-        #st.write("Scaler keys:", list(sc.keys())[:12])
-#--- Commented out above scaler as an optional fix and replced with below 2 lines ---
+    # Scaler status
     sc = load_scaler()
-st.write("Scaler loaded:", sc is not None, "| type:", type(sc).__name__ if sc else "—")
+    st.write("Scaler loaded:", bool(sc))
+    st.write("Scaler is MinMaxScaler:", hasattr(sc, "transform") and hasattr(sc, "inverse_transform"))
 
-
-
-    
+    # Google Sheets
     ws, info = _get_gsheet()
     if ws is None:
         st.write("Google Sheets: not configured –", info)
     else:
-        st.write("Google Sheets: connected ✅  (worksheet:", ws.title, ")")
-        st.write("Share this sheet with:", info)
+        st.write("Google Sheets: connected ✅")
+        st.write("Worksheet:", ws.title)
+        st.write("Service account:", info)
+
+
+
 
 
 # ---------- Refresh watchlist (ad-hoc) ----------
