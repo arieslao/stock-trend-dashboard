@@ -285,10 +285,15 @@ def load_scaler():
     ]:
         if p.exists():
             try:
-                return joblib.load(p)
+                obj = joblib.load(p)
+                # NEW: unwrap if your joblib file is {"scaler": <MinMaxScaler>, "feats": [...]}
+                if isinstance(obj, dict) and "scaler" in obj:
+                    obj = obj["scaler"]
+                return obj
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
+
 
 # -------- Robust scaler utilities --------
 def _scaler_can_api(s) -> bool:
@@ -500,12 +505,18 @@ with st.expander("🔧 Diagnostics & Integrations", expanded=False):
         except Exception:
             pass
 
+   # sc = load_scaler()
+   # st.write("Scaler loaded:", sc is not None)
+   # if isinstance(sc, dict):
+        # --- surface which keys exist so you can see what’s inside your saved scaler
+        #st.write("Scaler keys:", list(sc.keys())[:12])
+#--- Commented out above scaler as an optional fix and replced with below 2 lines ---
     sc = load_scaler()
-    st.write("Scaler loaded:", sc is not None)
-    if isinstance(sc, dict):
-        # surface which keys exist so you can see what’s inside your saved scaler
-        st.write("Scaler keys:", list(sc.keys())[:12])
+st.write("Scaler loaded:", sc is not None, "| type:", type(sc).__name__ if sc else "—")
 
+
+
+    
     ws, info = _get_gsheet()
     if ws is None:
         st.write("Google Sheets: not configured –", info)
