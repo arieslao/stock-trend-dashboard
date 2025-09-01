@@ -238,6 +238,70 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
     df.set_index("time", inplace=True)
     return df[["o", "h", "l", "close", "v"]]
 
+# ---------- History cache helpers ----------
+def _ohlcv_normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with columns named: open, high, low, close, volume."""
+    d = df.copy()
+    if {"o", "h", "l", "close", "v"}.issubset(d.columns):
+        d = d.rename(columns={"o": "open", "h": "high", "l": "low", "v": "volume"})
+    elif {"Open", "High", "Low", "Close"}.issubset(d.columns):
+        d = d.rename(columns={"Open": "open", "High": "high", "Low": "low",
+                              "Close": "close", "Volume": "volume"})
+    return d
+
+def _put_cache(symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+    st.session_state.setdefault("history_cache", {})[symbol] = df
+    return df
+
+def _get_cache(symbol: str) -> pd.DataFrame | None:
+    return st.session_state.get("history_cache", {}).get(symbol)
+
+def fetch_history(symbol: str, days: int, *, allow_live_fallback: bool = True) -> pd.DataFrame | None:
+    """
+    1) Return from our in-memory cache if present.
+    2) Else try the cached @st.cache_data call (respects windows).
+    3) Else (optionally) one-time live fetch with ignore_windows=True, then cache it.
+    """
+    # 1) in-memory cache?
+    df = _get_cache(symbol)
+    if df is not None and not df.empty:
+        return df
+
+    # 2) try normal cached function (respects windows)
+    try:
+        df2 = get_candles(symbol, days=days)  # may raise if outside window and not cached
+        if df2 is not None and not df2.empty:
+            return _put_cache(symbol, df2)
+    except Exception:
+        pass
+
+    # 3) one-time live fallback
+    if allow_live_fallback and not st.session_state.get(f"_once_live_{symbol}", False):
+        try:
+            df3 = get_candles(symbol, days=days, ignore_windows=True)
+            st.session_state[f"_once_live_{symbol}"] = True
+            if df3 is not None and not df3.empty:
+                return _put_cache(symbol, df3)
+        except Exception:
+            st.session_state[f"_once_live_{symbol}"] = True
+
+    return None
+
+def prime_watchlist_cache(symbols: list[str], days: int) -> list[str]:
+    """Bulk live fetch (ignore windows) and put into cache. Returns list of successes."""
+    ok = []
+    for s in symbols:
+        try:
+            df = get_candles(s, days=days, ignore_windows=True)
+            if df is not None and not df.empty:
+                _put_cache(s, df)
+                ok.append(s)
+        except Exception:
+            pass
+    return ok
+
+
+
 
 # ---------- Model helpers ----------
 @st.cache_resource(show_spinner=False)
@@ -557,35 +621,50 @@ with st.container():
             st.rerun()
 
 
-# ---------- Watchlist (click the ticker to focus) ----------
+
+# ---------- Watchlist table ----------
 rows = []
+
 with st.spinner("Scoring watchlist…"):
-    for s in watchlist:
+    for s in (watchlist or []):
         try:
-            d = get_candles(s, days=days)
+            d = fetch_history(s, days, allow_live_fallback=False)  # first try cache / normal path
+            if d is None or d.empty:
+                # last resort: live fallback once for this symbol in this run
+                d = fetch_history(s, days, allow_live_fallback=True)
+
             if d is None or d.empty:
                 raise RuntimeError("no history")
-            last_close = float(d["close"].iloc[-1])
 
-            model_used_row, next_pred = "Linear", None
+            dN = _ohlcv_normalize(d)
+            if "close" not in dN.columns:
+                raise RuntimeError("missing close")
+
+            last_close = float(dN["close"].iloc[-1])
+
+            # Choose model per the selector
+            model_used_row = "Linear"
+            next_pred = None
+
             if using_cnn():
-                next_pred = predict_next_close_cnnlstm(s, d, lookback=DEFAULT_LOOKBACK)
+                next_pred = predict_next_close_cnnlstm(s, dN, lookback=DEFAULT_LOOKBACK)
                 if next_pred is not None:
                     model_used_row = "CNN-LSTM"
                 else:
-                    feat_row = featurize(d)
+                    # fallback to Linear
+                    feat_row = featurize(dN)
                     if not feat_row.empty:
                         _, next_pred = fit_and_predict(feat_row)
                         model_used_row = "Linear (fallback)"
             else:
-                feat_row = featurize(d)
+                feat_row = featurize(dN)
                 if not feat_row.empty:
                     _, next_pred = fit_and_predict(feat_row)
 
             if next_pred is None:
                 raise RuntimeError("prediction failed")
 
-            ret = 100.0 * (next_pred - last_close) / last_close
+            ret = 100.0 * (float(next_pred) - last_close) / last_close
             signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
 
             rows.append({
@@ -594,13 +673,62 @@ with st.spinner("Scoring watchlist…"):
                 "Predicted": round(float(next_pred), 2),
                 "Δ%": round(float(ret), 2),
                 "Signal": signal,
-                "Model": model_used_row,
+                "Model": model_used_row
             })
         except Exception:
             rows.append({
-                "Symbol": s, "Last": None, "Predicted": None, "Δ%": None,
-                "Signal": "ERR", "Model": "—",
+                "Symbol": s,
+                "Last": None, "Predicted": None, "Δ%": None,
+                "Signal": "ERR", "Model": "—"
             })
+
+if rows:
+    table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False, na_position="last")
+    st.subheader("Watchlist signals")
+    # Make symbols clickable (focus switch) but DON'T open a new tab
+    st.dataframe(
+        table.assign(_focus=[f"▶ {sym}" for sym in table.index]).reset_index(),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Small row of focus buttons under the table (keeps everything in-page)
+    click_cols = st.columns(min(6, len(table)))
+    for i, sym in enumerate(table.index.tolist()):
+        with click_cols[i % len(click_cols)]:
+            if st.button(f"Focus {sym}", key=f"focus_btn_{sym}", type=("secondary" if sym != symbol else "primary")):
+                st.session_state["focus_symbol"] = sym
+                try:
+                    st.query_params["focus"] = sym  # update URL without opening a new window
+                except Exception:
+                    pass
+                st.rerun()
+
+    # --- (optional) log watchlist predictions to Google Sheets ---
+    try:
+        to_log = []
+        for r in rows:
+            if r.get("Predicted") is None or r.get("Last") is None:
+                continue
+            to_log.append({
+                "ts_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "ts_pt": now_la().strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": r["Symbol"],
+                "model": r["Model"],
+                "lookback": (DEFAULT_LOOKBACK if "CNN" in (r["Model"] or "") else ""),
+                "days_history": days,
+                "last_close": r["Last"],
+                "predicted": r["Predicted"],
+                "pct_change": r["Δ%"],
+                "in_window": in_window(),
+                "ma10": "", "ma50": "",
+                "note": "watchlist",
+            })
+        if to_log:
+            append_prediction_rows(to_log)
+    except Exception:
+        pass
+
 
 st.subheader("Watchlist signals")
 
