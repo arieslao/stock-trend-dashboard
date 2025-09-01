@@ -389,8 +389,7 @@ with st.sidebar:
     watchlist = st.multiselect("Watchlist", default_watchlist, default=default_watchlist)
     days = st.slider("History (days)", 90, 365, 180, step=5)
     alert_pct = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.25)
-    symbol = st.selectbox("Focus symbol", watchlist or default_watchlist)
-
+    
     st.subheader("Model")
     MODEL_LINEAR = "Linear (MA10/MA50)"
     MODEL_CNN    = "CNN-LSTM (pretrained)"
@@ -413,6 +412,29 @@ with st.sidebar:
 def using_cnn() -> bool:
     return st.session_state.get("model_choice", "Linear (MA10/MA50)") == "CNN-LSTM (pretrained)"
 
+# --- Focus symbol state (driven by watchlist and URL) ---
+# If URL contains ?focus=XYZ, honor it
+try:
+    qp = st.query_params
+    url_focus = qp.get("focus")
+except Exception:
+    url_focus = None
+
+if "focus_symbol" not in st.session_state:
+    st.session_state["focus_symbol"] = (watchlist[0] if watchlist else default_watchlist[0])
+
+# If current focus fell out of the watchlist (user changed watchlist), snap to first
+if watchlist and st.session_state["focus_symbol"] not in watchlist:
+    st.session_state["focus_symbol"] = watchlist[0]
+
+# If a focus is provided in the URL and it’s in the watchlist, use it
+if url_focus and isinstance(url_focus, str) and url_focus in (watchlist or []):
+    st.session_state["focus_symbol"] = url_focus
+
+# Use this everywhere below instead of 'symbol'
+symbol = st.session_state["focus_symbol"]
+
+
 # ---------- Diagnostics ----------
 with st.expander("🛠️ Diagnostics", expanded=False):
     st.write("Python:", sys.version.split()[0])
@@ -434,6 +456,21 @@ with st.expander("🛠️ Diagnostics", expanded=False):
                 st.success(f"Cached {len(df_live)} rows for {symbol} (Yahoo).")
             except Exception as e:
                 st.error(f"Force fetch failed: {e}")
+                #--- adding code so the cache stores/reads by focus ---
+                df_live = get_candles(focus, days=days, ignore_windows=True)
+                st.session_state.setdefault("history_cache", {})[focus] = df_live
+                # --- end code addition ---
+try:
+    px_live = get_quote(focus, ignore_windows=True)
+    st.session_state.setdefault("quote_cache", {})[focus] = px_live
+except Exception as qe:
+    st.warning(f"Quote prime failed (but history cached): {qe}")
+
+st.success(f"Cached {len(df_live)} rows for {focus} (Yahoo).")
+
+
+
+    
     with colB:
         if st.button("Test history fetch (AAPL, 30d)"):
             try:
@@ -455,27 +492,44 @@ with st.expander("🔎 CNN-LSTM status", expanded=False):
         st.write("Worksheet:", ws.title)
         st.write("Service account:", info)
 
+# --- Click a ticker to set focus in watchlist table---
+st.markdown("#### Click a symbol to focus")
+if watchlist:
+    cols = st.columns(min(len(watchlist), 6))
+    for i, s in enumerate(watchlist):
+        with cols[i % len(cols)]:
+            if st.button(s, key=f"focus_{s}", type=("secondary" if s != symbol else "primary"), use_container_width=True):
+                st.session_state["focus_symbol"] = s
+                # also update URL so refreshes/bookmarks keep your choice
+                try:
+                    st.query_params["focus"] = s
+                except Exception:
+                    pass
+                st.rerun()
+else:
+    st.info("Your watchlist is empty. Add symbols in the sidebar.")
+
 
 # ---------- Focus symbol KPIs & Chart ----------
 # 1) Quote
 price = None
 if "quote_cache" in st.session_state and symbol in st.session_state["quote_cache"]:
-    price = st.session_state["quote_cache"][symbol]
+    price = st.session_state["quote_cache"][focus]
 
 if price is None:
     try:
-        price = get_quote(symbol)  # respects window
+        price = get_quote(focus)  # respects window
     except Exception as e:
         st.warning(f"Quote unavailable: {e}. Using last cached quote if any.")
         # keep price None if not cached
 
 title_right = f"{price:,.2f}" if price is not None else "—"
-st.subheader(f"{symbol} — Live: {title_right}")
+st.subheader(f"{focus} — Live: {title_right}")
 
 # 2) History + chart + forecast
 df = None
-if "history_cache" in st.session_state and symbol in st.session_state["history_cache"]:
-    df = st.session_state["history_cache"][symbol]
+if "history_cache" in st.session_state and focus in st.session_state["history_cache"]:
+    df = st.session_state["history_cache"][focus]
 
 if df is None:
     try:
@@ -559,22 +613,35 @@ with col1:
     else:
         st.info("No history to chart yet. Try Diagnostics → fetch cache.")
 
+# --- KPI / prediction panel ---
 with col2:
-    if (df is not None and not df.empty and next_price is not None):
-        st.metric("Predicted next close", f"{next_price:.2f}",
-                  f"{pct_change:+.2f}% vs last" if pct_change is not None else None)
+    if df is not None and not df.empty and next_price is not None:
+        # recompute safely (so we don't rely on an earlier pct_change variable)
+        last_close = float(df["close"].iloc[-1])
+        pct_change = 100.0 * (next_price - last_close) / last_close
+
+        st.metric(
+            "Predicted next close",
+            f"{next_price:,.2f}",
+            f"{pct_change:+.2f}% vs last"
+        )
         st.caption(f"Model: {model_used}")
-        if pct_change is not None:
-            if pct_change >= alert_pct:
-                st.success(f"Potential BUY momentum (≥ {alert_pct}%).")
-            elif pct_change <= -alert_pct:
-                st.error(f"Potential SELL momentum (≤ -{alert_pct}%).")
-            else:
-                st.info("No strong signal at your threshold.")
+
+        if pct_change >= alert_pct:
+            st.success(f"Potential BUY momentum (≥ {alert_pct}%).")
+        elif pct_change <= -alert_pct:
+            st.error(f"Potential SELL momentum (≤ -{alert_pct}%).")
+        else:
+            st.info("No strong signal at your threshold.")
     else:
+        # no prediction available yet
         st.metric("Predicted next close", "—")
+        # still show which model we tried to use (if any)
         if df is not None and not df.empty:
             st.caption(f"Model: {model_used}")
+        else:
+            st.caption("Model: —")
+
 
     # --- log focus symbol (if we have a prediction) ---
     try:
@@ -601,6 +668,27 @@ with col2:
     except Exception:
         pass
 
+# --- One-shot refresh for all symbols (ignores time windows) ---
+with st.container():
+    if st.button("🔄 Refresh watchlist (live fetch once)", help="Fetch fresh quotes & candles for all symbols now, ignoring the time windows."):
+        st.session_state.setdefault("history_cache", {})
+        st.session_state.setdefault("quote_cache", {})
+        refreshed = []
+        for s in watchlist:
+            try:
+                d = get_candles(s, days=days, ignore_windows=True)
+                st.session_state["history_cache"][s] = d
+                try:
+                    q = get_quote(s, ignore_windows=True)
+                    st.session_state["quote_cache"][s] = q
+                except Exception:
+                    pass
+                refreshed.append(s)
+            except Exception as e:
+                st.warning(f"{s}: {e}")
+        if refreshed:
+            st.success(f"Refreshed: {', '.join(refreshed)}")
+            st.rerun()
 
 
 # ---------- Watchlist table ----------
@@ -686,4 +774,12 @@ if rows:
     except Exception:
         pass
 
+# ---- put this once, after you build the watchlist and (maybe) set init focus ----
+def get_focus_symbol() -> str:
+    # ensure we always have one
+    if "focus_symbol" not in st.session_state:
+        st.session_state["focus_symbol"] = (watchlist or ["AAPL"])[0]
+    return st.session_state["focus_symbol"]
+
+focus = get_focus_symbol()
 
