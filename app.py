@@ -1,10 +1,11 @@
 # ---------- Imports ----------
-import os, sys, json, requests
+import os, json, requests
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from typing import List, Dict
 
-# --- Optional / safe TF import (only used if you pick the CNN-LSTM model) ---
+# Optional / safe TF import (only used if you pick the CNN-LSTM model)
 try:
     import tensorflow as tf  # noqa: F401
 except Exception:
@@ -13,41 +14,35 @@ except Exception:
 import numpy as np
 import pandas as pd
 import joblib
-
-from sklearn.preprocessing import MinMaxScaler  # noqa: F401
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import MinMaxScaler  # noqa: F401
 
 import streamlit as st
 import plotly.graph_objects as go
 
 # ---------- Constants ----------
 FEATURE_COLS = ["open", "high", "low", "close", "volume"]
-CLOSE_IDX = FEATURE_COLS.index("close")  # 3
+CLOSE_IDX = FEATURE_COLS.index("close")
 DEFAULT_LOOKBACK = 60  # sequence length for CNN-LSTM
 
-# Columns / header for the Google Sheet
 LOG_COLUMNS = [
     "ts_utc", "ts_pt", "symbol", "model", "lookback",
     "days_history", "last_close", "predicted", "pct_change",
     "in_window", "ma10", "ma50", "note"
 ]
 
-# ---------- Optional Google Sheets logging ----------
-from typing import List, Dict
+# ---------- Google Sheets (optional) ----------
 try:
     import gspread
     from google.oauth2.service_account import Credentials
-except Exception:  # libs may not be installed on every run
+except Exception:
     gspread = None
     Credentials = None
 
 
 @st.cache_resource(show_spinner=False)
 def _get_gsheet():
-    """
-    Returns (worksheet, service_account_email) or (None, msg) if unavailable.
-    Looks in st.secrets first, then env vars.
-    """
+    """Return (worksheet, account_email) or (None, message)."""
     if not (gspread and Credentials):
         return None, "gspread / google-auth not installed"
 
@@ -74,7 +69,7 @@ def _get_gsheet():
     if not sheet_id:
         return None, "Missing GOOGLE_SHEETS_SHEET_ID"
     if not creds_info:
-        return None, "Missing service account JSON (st.secrets or env)"
+        return None, "Missing service account JSON"
 
     try:
         scopes = [
@@ -97,7 +92,7 @@ def _get_gsheet():
 
 
 def append_prediction_rows(rows: List[Dict]):
-    ws, info = _get_gsheet()
+    ws, _ = _get_gsheet()
     if ws is None:
         return
     payload = [[r.get(k, "") for k in LOG_COLUMNS] for r in rows]
@@ -107,16 +102,16 @@ def append_prediction_rows(rows: List[Dict]):
         pass
 
 
-# ---------- App Config ----------
+# ---------- App config ----------
 st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
 st.title("📈 AI-Powered Stock Trend Dashboard")
 st.caption(
     "Education only. Quotes & History: Yahoo (chart JSON). "
-    "Model: Linear Regression with MA10/MA50. "
-    "Request windows enforced (06:30 & 12:00 PT)."
+    "Models: CNN-LSTM (default) or Linear MA10/MA50 fallback. "
+    "Live fetch windows: 06:30 & 12:00 PT."
 )
 
-# ---------- Time-window helpers (Pacific Time) ----------
+# ---------- Time window helpers (Pacific) ----------
 LA = ZoneInfo("America/Los_Angeles")
 WINDOWS_PT = [dtime(6, 30), dtime(12, 0)]
 WINDOW_WIDTH_MIN = 7
@@ -146,8 +141,7 @@ def seconds_until_next_window() -> int:
     if not candidates:
         w = WINDOWS_PT[0]
         candidates.append((t + timedelta(days=1)).replace(hour=w.hour, minute=w.minute, second=0, microsecond=0))
-    delta = min(candidates) - t
-    return max(0, int(delta.total_seconds()))
+    return max(0, int((min(candidates) - t).total_seconds()))
 
 
 # ---------- Yahoo fetchers ----------
@@ -166,8 +160,7 @@ def get_quote(symbol: str, ignore_windows: bool = False) -> float:
     result = (j.get("chart", {}) or {}).get("result") or []
     if not result:
         raise RuntimeError("Yahoo quote: empty result")
-    meta = result[0].get("meta", {})
-    px = meta.get("regularMarketPrice")
+    px = (result[0].get("meta", {}) or {}).get("regularMarketPrice")
     if px is None:
         raise RuntimeError("Yahoo quote: missing regularMarketPrice")
     return float(px)
@@ -202,7 +195,7 @@ def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> p
     return df[["o", "h", "l", "close", "v"]]
 
 
-# ---------- CNN-LSTM helpers ----------
+# ---------- Model helpers ----------
 @st.cache_resource(show_spinner=False)
 def load_cnn_lstm(symbol: str | None = None):
     if tf is None:
@@ -224,13 +217,12 @@ def load_cnn_lstm(symbol: str | None = None):
 
 @st.cache_resource(show_spinner=False)
 def load_scaler():
-    candidates = [
+    for p in [
         Path("models") / "scaler_ALL.pkl",
         Path("models") / "scaler.pkl",
         Path("scaler_ALL.pkl"),
         Path("scaler.pkl"),
-    ]
-    for p in candidates:
+    ]:
         if p.exists():
             try:
                 return joblib.load(p)
@@ -272,46 +264,39 @@ def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
 
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
-    model = load_cnnlstm(symbol)
+    model = load_cnn_lstm(symbol)
     if model is None:
-        st.info("CNN-LSTM model unavailable; using fallback.")
         return None
     X, _ = make_cnnlstm_input(df, lookback=lookback)
     if X is None:
         return None
     try:
         y_scaled = float(model.predict(X, verbose=0)[0][0])
-    except Exception as e:
-        st.warning(f"CNN-LSTM predict failed: {e}")
+    except Exception:
         return None
     scaler = load_scaler()
     dummy = np.zeros((1, len(FEATURE_COLS)))
     dummy[0, CLOSE_IDX] = y_scaled
     try:
-        unscaled = scaler.inverse_transform(dummy)[0, CLOSE_IDX]
-        return float(unscaled)
-    except Exception as e:
-        st.warning(f"Scaler.inverse_transform failed: {e}")
+        return float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+    except Exception:
         return None
 
 
-# ---------- Feature engineering + Linear model ----------
 def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out = _normalize_ohlcv(df)
     if 'close' not in out.columns:
         return pd.DataFrame()
     out["MA10"] = out["close"].rolling(10).mean()
     out["MA50"] = out["close"].rolling(50).mean()
-    out = out.dropna()
-    return out
+    return out.dropna()
 
 
 def fit_and_predict(df_features: pd.DataFrame) -> tuple[LinearRegression, float]:
     X = df_features[["MA10", "MA50"]]
     y = df_features["close"]
     model = LinearRegression().fit(X, y)
-    last = df_features.iloc[-1][["MA10", "MA50"]].values.reshape(1, -1)
-    pred = float(model.predict(last)[0])
+    pred = float(model.predict(df_features.iloc[[-1]][["MA10", "MA50"]])[0])
     return model, pred
 
 
@@ -325,75 +310,62 @@ with st.sidebar:
 
     st.subheader("Model")
     MODEL_LINEAR = "Linear (MA10/MA50)"
-    MODEL_CNN    = "CNN-LSTM (pretrained)"
+    MODEL_CNN = "CNN-LSTM (pretrained)"
+    # Default to CNN-LSTM (index=1)
     model_choice = st.selectbox(
         "Choose model",
         (MODEL_LINEAR, MODEL_CNN),
-        index=0,
-        help="Linear is fast and simple. CNN-LSTM uses a pretrained deep model."
+        index=1,
+        help="Linear is simple; CNN-LSTM uses a pretrained deep model (falls back to Linear if unavailable)."
     )
     st.session_state["model_choice"] = model_choice
 
     mins = seconds_until_next_window() // 60
     if in_window():
-        st.success("✅ Inside fetch window (Pacific Time). Live pulls allowed.")
+        st.success("✅ Inside fetch window (PT). Live pulls allowed.")
     else:
-        st.info(f"🕰️ Outside fetch window. Using cached data if available. "
-                f"Next window opens in ~{mins} min (Pacific).")
+        st.info(f"🕰️ Outside fetch window. Using cache if available. Next window in ~{mins} min.")
 
 
 def using_cnn() -> bool:
-    return st.session_state.get("model_choice", "Linear (MA10/MA50)") == "CNN-LSTM (pretrained)"
+    return st.session_state.get("model_choice") == "CNN-LSTM (pretrained)"
 
 
-# --- Focus symbol state (URL + watchlist defaults) ---
-try:
-    qp = st.query_params
-    url_focus = qp.get("focus")
-except Exception:
-    url_focus = None
-
+# ---------- Focus symbol state ----------
 if "focus_symbol" not in st.session_state:
     st.session_state["focus_symbol"] = (watchlist[0] if watchlist else default_watchlist[0])
-
+# If focus fell out of current watchlist, snap to first available
 if watchlist and st.session_state["focus_symbol"] not in watchlist:
     st.session_state["focus_symbol"] = watchlist[0]
-
-if url_focus and isinstance(url_focus, str) and url_focus in (watchlist or []):
-    st.session_state["focus_symbol"] = url_focus
-
 focus = st.session_state["focus_symbol"]
 
 
 # ---------- Diagnostics ----------
 with st.expander("🛠️ Diagnostics", expanded=False):
-    st.write("Python:", sys.version.split()[0])
+    st.write("Python:", st.__version__ if hasattr(st, "__version__") else "—")
     st.write("Now (PT):", now_la().strftime("%Y-%m-%d %H:%M:%S"))
     st.write("In window:", in_window())
     st.write("Next window in (min):", seconds_until_next_window() // 60)
 
     colA, colB = st.columns(2)
-
     with colA:
-        if st.button("Force one-time LIVE fetch & cache for focus symbol"):
-            if focus:
+        if st.button("Force LIVE fetch for focus"):
+            try:
+                df_live = get_candles(focus, days=days, ignore_windows=True)
+                st.session_state.setdefault("history_cache", {})[focus] = df_live
                 try:
-                    df_live = get_candles(focus, days=days, ignore_windows=True)
-                    st.session_state.setdefault("history_cache", {})[focus] = df_live
-                    try:
-                        px_live = get_quote(focus, ignore_windows=True)
-                        st.session_state.setdefault("quote_cache", {})[focus] = px_live
-                    except Exception as qe:
-                        st.warning(f"Quote prime failed (but history cached): {qe}")
-                    st.success(f"Cached {len(df_live)} rows for {focus} (Yahoo).")
-                except Exception as e:
-                    st.error(f"Force fetch failed: {e}")
-
+                    px_live = get_quote(focus, ignore_windows=True)
+                    st.session_state.setdefault("quote_cache", {})[focus] = px_live
+                except Exception as qe:
+                    st.warning(f"Quote prime failed (but history cached): {qe}")
+                st.success(f"Cached {len(df_live)} rows for {focus}.")
+            except Exception as e:
+                st.error(f"Force fetch failed: {e}")
     with colB:
         if st.button("Test history fetch (AAPL, 30d)"):
             try:
                 df_debug = get_candles("AAPL", days=30, ignore_windows=True)
-                st.success(f"Fetched {len(df_debug)} AAPL rows via Yahoo.")
+                st.success(f"Fetched {len(df_debug)} AAPL rows.")
                 st.dataframe(df_debug.tail())
             except Exception as e:
                 st.error(f"History test failed: {e}")
@@ -408,20 +380,18 @@ with st.expander("🔎 Integrations status", expanded=False):
         st.write("Worksheet:", ws.title)
         st.write("Service account:", info)
 
-
 # ---------- Focus symbol KPIs & Chart ----------
 price = st.session_state.get("quote_cache", {}).get(focus)
-if price is None and focus:
+if price is None:
     try:
         price = get_quote(focus)
     except Exception as e:
-        st.warning(f"Quote unavailable: {e}. Using last cached quote if any.")
+        st.warning(f"Quote unavailable: {e}. Using last cached if any.")
 
-title_right = f"{price:,.2f}" if price is not None else "—"
-st.subheader(f"{focus} — Live: {title_right}")
+st.subheader(f"{focus} — Live: {price:,.2f}" if price is not None else f"{focus} — Live: —")
 
 df = st.session_state.get("history_cache", {}).get(focus)
-if df is None and focus:
+if df is None:
     try:
         df = get_candles(focus, days=days)
     except Exception as e:
@@ -431,56 +401,45 @@ if df is None and focus:
 col1, col2 = st.columns([3, 1])
 
 next_price, pct_change, model_used = None, None, "—"
-
 if df is not None and not df.empty:
     last_close = float(df["close"].iloc[-1])
     if using_cnn():
         npred = predict_next_close_cnnlstm(focus, df, lookback=DEFAULT_LOOKBACK)
         if npred is not None:
-            next_price = float(npred)
-            model_used = "CNN-LSTM"
+            next_price = float(npred); model_used = "CNN-LSTM"
         else:
             feat = featurize(df)
             if not feat.empty:
-                _, next_price = fit_and_predict(feat)
-                model_used = "Linear (fallback)"
+                _, next_price = fit_and_predict(feat); model_used = "Linear (fallback)"
     else:
         feat = featurize(df)
         if not feat.empty:
-            _, next_price = fit_and_predict(feat)
-            model_used = "Linear"
+            _, next_price = fit_and_predict(feat); model_used = "Linear"
     if next_price is not None:
         pct_change = 100.0 * (next_price - last_close) / last_close
 
 with col1:
     if df is not None and not df.empty:
-        df_plot = _normalize_ohlcv(df.copy())
-        if not {'open', 'high', 'low', 'close'}.issubset(df_plot.columns):
-            st.error(f"Data missing columns for candlestick. Got {list(df_plot.columns)}")
-        else:
-            df_plot["MA10"] = df_plot["close"].rolling(10).mean()
-            df_plot["MA50"] = df_plot["close"].rolling(50).mean()
-            fig = go.Figure(
-                data=[
-                    go.Candlestick(
-                        x=df_plot.index,
-                        open=df_plot["open"],
-                        high=df_plot["high"],
-                        low=df_plot["low"],
-                        close=df_plot["close"],
-                        name=f"{focus} OHLC",
-                    )
-                ]
-            )
-            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["MA10"], name="MA10", mode="lines"))
-            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot["MA50"], name="MA50", mode="lines"))
+        d = _normalize_ohlcv(df)
+        if {'open', 'high', 'low', 'close'}.issubset(d.columns):
+            d["MA10"] = d["close"].rolling(10).mean()
+            d["MA50"] = d["close"].rolling(50).mean()
+            fig = go.Figure([
+                go.Candlestick(
+                    x=d.index, open=d["open"], high=d["high"],
+                    low=d["low"], close=d["close"], name=f"{focus} OHLC"
+                )
+            ])
+            fig.add_trace(go.Scatter(x=d.index, y=d["MA10"], name="MA10", mode="lines"))
+            fig.add_trace(go.Scatter(x=d.index, y=d["MA50"], name="MA50", mode="lines"))
             fig.update_layout(
-                xaxis_rangeslider_visible=False,
-                height=350,
+                xaxis_rangeslider_visible=False, height=350,
                 margin=dict(l=10, r=10, t=10, b=10),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("Missing columns for candlestick.")
     else:
         st.info("No history to chart yet. Try Diagnostics → fetch cache.")
 
@@ -496,13 +455,8 @@ with col2:
             st.error(f"Potential SELL momentum (≤ -{alert_pct}%).")
         else:
             st.info("No strong signal at your threshold.")
-    else:
-        st.metric("Predicted next close", "—")
-        st.caption(f"Model: {model_used if df is not None and not df.empty else '—'}")
-
-    # Log focus prediction to Google Sheets
-    try:
-        if df is not None and not df.empty and next_price is not None and focus:
+        # Log focus prediction (optional)
+        try:
             ma10 = df["close"].rolling(10).mean().iloc[-1] if len(df) >= 10 else ""
             ma50 = df["close"].rolling(50).mean().iloc[-1] if len(df) >= 50 else ""
             append_prediction_rows([{
@@ -520,13 +474,16 @@ with col2:
                 "ma50": float(ma50) if ma50 != "" else "",
                 "note": "focus",
             }])
-    except Exception:
-        pass
+        except Exception:
+            pass
+    else:
+        st.metric("Predicted next close", "—")
+        st.caption(f"Model: {model_used if df is not None and not df.empty else '—'}")
 
-# --- one-shot refresh all (ignores windows) ---
+# ---------- Refresh watchlist (live) ----------
 with st.container():
     if st.button("🔄 Refresh watchlist (live fetch once)",
-                 help="Fetch fresh quotes & candles for all symbols now, ignoring the time windows."):
+                 help="Fetch all symbols now, ignoring fetch windows."):
         st.session_state.setdefault("history_cache", {})
         st.session_state.setdefault("quote_cache", {})
         refreshed = []
@@ -546,7 +503,7 @@ with st.container():
             st.success(f"Refreshed: {', '.join(refreshed)}")
             st.rerun()
 
-# ---------- Watchlist (click the Symbol link to set focus) ----------
+# ---------- Watchlist (click the ticker to focus) ----------
 rows = []
 with st.spinner("Scoring watchlist…"):
     for s in watchlist:
@@ -556,9 +513,7 @@ with st.spinner("Scoring watchlist…"):
                 raise RuntimeError("no history")
             last_close = float(d["close"].iloc[-1])
 
-            model_used_row = "Linear"
-            next_pred = None
-
+            model_used_row, next_pred = "Linear", None
             if using_cnn():
                 next_pred = predict_next_close_cnnlstm(s, d, lookback=DEFAULT_LOOKBACK)
                 if next_pred is not None:
@@ -589,36 +544,37 @@ with st.spinner("Scoring watchlist…"):
             })
         except Exception:
             rows.append({
-                "Symbol": s,
-                "Last": None, "Predicted": None, "Δ%": None,
+                "Symbol": s, "Last": None, "Predicted": None, "Δ%": None,
                 "Signal": "ERR", "Model": "—",
             })
+
+st.subheader("Watchlist signals")
 
 if rows:
     table = pd.DataFrame(rows).sort_values("Δ%", ascending=False)
 
-    st.subheader("Watchlist signals")
+    # Render a “table-like” layout with a clickable Symbol button per row
+    header_cols = st.columns([1.1, 1, 1, 0.8, 0.9, 1.2])
+    for col, label in zip(header_cols, ["Symbol", "Last", "Predicted", "Δ%", "Signal", "Model"]):
+        col.markdown(f"**{label}**")
 
-    # --- 1) Clickable markdown table (Symbol is a link to ?focus=SYMB) ---
-    md_lines = ["| Symbol | Last | Predicted | Δ% | Signal | Model |",
-                "|:------|-----:|----------:|---:|:------:|:------|"]
-    for _, r in table.iterrows():
-        sym = r["Symbol"]
-        # relative link to same app with focus param
-        sym_link = f"[{sym}](?focus={sym})"
-        last = "" if pd.isna(r["Last"]) else f"{r['Last']:.2f}"
-        pred = "" if pd.isna(r["Predicted"]) else f"{r['Predicted']:.2f}"
-        dpc = "" if pd.isna(r["Δ%"]) else f"{r['Δ%']:.2f}"
-        sig = r["Signal"]
-        model = r["Model"]
-        md_lines.append(f"| {sym_link} | {last} | {pred} | {dpc} | {sig} | {model} |")
-    st.markdown("\n".join(md_lines))
+    for i, r in table.reset_index(drop=True).iterrows():
+        c1, c2, c3, c4, c5, c6 = st.columns([1.1, 1, 1, 0.8, 0.9, 1.2])
+        # Symbol as a button (styled like a link via label)
+        if c1.button(r["Symbol"], key=f"sym_{r['Symbol']}"):
+            st.session_state["focus_symbol"] = r["Symbol"]
+            st.rerun()
+        c2.write("" if pd.isna(r["Last"]) else f"{r['Last']:.2f}")
+        c3.write("" if pd.isna(r["Predicted"]) else f"{r['Predicted']:.2f}")
+        c4.write("" if pd.isna(r["Δ%"]) else f"{r['Δ%']:.2f}")
+        c5.write(r["Signal"])
+        c6.write(r["Model"])
 
-    # --- 2) (Optional) show a sortable dataframe under the markdown table ---
-    with st.expander("Show sortable table", expanded=False):
+    # Optional: also show a sortable raw grid below
+    with st.expander("Show sortable data grid", expanded=False):
         st.dataframe(table, use_container_width=True)
 
-    # --- log watchlist predictions ---
+    # Log watchlist predictions
     try:
         to_log = []
         for r in rows:
