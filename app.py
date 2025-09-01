@@ -692,17 +692,21 @@ if rows:
         hide_index=True
     )
 
-    # Small row of focus buttons under the table (keeps everything in-page)
-    click_cols = st.columns(min(6, len(table)))
-    for i, sym in enumerate(table.index.tolist()):
-        with click_cols[i % len(click_cols)]:
-            if st.button(f"Focus {sym}", key=f"focus_btn_{sym}", type=("secondary" if sym != symbol else "primary")):
-                st.session_state["focus_symbol"] = sym
-                try:
-                    st.query_params["focus"] = sym  # update URL without opening a new window
-                except Exception:
-                    pass
-                st.rerun()
+  # --- Small row of focus buttons under the table (keeps everything in-page) ---
+click_cols = st.columns(min(6, len(table)))
+for i, sym in enumerate(table.index.tolist()):
+    with click_cols[i % len(click_cols)]:
+        is_active = (st.session_state.get("focus_symbol") == sym)
+        if st.button(sym, key=f"focus_btn_{sym}",
+                     type=("primary" if is_active else "secondary"),
+                     use_container_width=True):
+            st.session_state["focus_symbol"] = sym
+            try:
+                st.query_params["focus"] = sym   # update URL without new tab
+            except Exception:
+                pass
+            st.rerun()
+
 
     # --- (optional) log watchlist predictions to Google Sheets ---
     try:
