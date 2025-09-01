@@ -291,6 +291,28 @@ def load_scaler():
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
+# ------ Added Helper to troubleshoot CNN-LTSM model ------
+
+def _scaler_can_api(s) -> bool:
+    return hasattr(s, "transform") and hasattr(s, "inverse_transform")
+
+def _scaler_get_scale_min(s):
+    """
+    Return (scale_, min_) as numpy arrays if available.
+    Works for real MinMaxScaler (attributes) or a dict persisted via joblib.
+    """
+    try:
+        if hasattr(s, "scale_") and hasattr(s, "min_"):
+            return np.asarray(s.scale_), np.asarray(s.min_)
+        if isinstance(s, dict):
+            if "scale_" in s and "min_" in s:
+                return np.asarray(s["scale_"]), np.asarray(s["min_"])
+            if "scale" in s and "min" in s:  # just in case
+                return np.asarray(s["scale"]), np.asarray(s["min"])
+    except Exception:
+        pass
+    return None, None
+
 
 
 def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
@@ -314,9 +336,10 @@ def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
     """
-    Robust CNN-LSTM predictor for 5-feature models (OHLCV) or 1-feature (close-only).
-    Emits a short warning if it has to fall back so you can see *why*.
-    Returns a float price or None.
+    Robust CNN-LSTM predictor that supports:
+      • 5-feature OHLCV models, or
+      • 1-feature (close-only) models
+    and works with either a real MinMaxScaler OR a dict with scale_/min_.
     """
     if tf is None:
         st.warning("CNN-LSTM unavailable (TensorFlow missing).")
@@ -337,8 +360,6 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
     if not set(need_cols).issubset(d.columns):
         st.warning("CNN-LSTM: missing OHLCV columns.")
         return None
-
-    # Use only rows that have all 5 features
     d = d.dropna(subset=need_cols)
     if len(d) < lookback:
         st.warning(f"CNN-LSTM: not enough clean rows (have {len(d)}, need {lookback}).")
@@ -349,7 +370,7 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
         st.warning("CNN-LSTM: scaler not loaded.")
         return None
 
-    # How many features does the model actually expect?
+    # Model feature count
     try:
         n_feats = int(model.input_shape[-1])
     except Exception:
@@ -357,17 +378,30 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
 
     try:
         if n_feats == 1:
-            # Close-only model, but we only have the 5-feature MinMaxScaler.
-            # Recreate close scaling from it: x_scaled = x * scale_[close] + min_[close]
-            a = float(scaler.scale_[CLOSE_IDX])
-            b = float(scaler.min_[CLOSE_IDX])
+            # CLOSE-ONLY MODEL
+            # Build (1, L, 1) using scale_/min_ if we can; else try API
+            scale_, min_ = _scaler_get_scale_min(scaler)
             seq = d["close"].tail(lookback).to_numpy().reshape(-1, 1)  # (L,1)
-            X = (seq * a + b)[np.newaxis, :, :]                        # (1,L,1)
+            if scale_ is not None and min_ is not None:
+                X = (seq * scale_[CLOSE_IDX] + min_[CLOSE_IDX])[np.newaxis, :, :]  # (1,L,1)
+            elif _scaler_can_api(scaler):
+                X = scaler.transform(seq)  # unlikely supported, but try
+                X = X[np.newaxis, :, :]
+            else:
+                st.warning("CNN-LSTM: scaler has neither API nor scale_/min_.")
+                return None
         else:
-            # 5-feature model
-            block = d[['open','high','low','close','volume']].tail(lookback).to_numpy()  # (L,5)
-            block_scaled = scaler.transform(block)                                       # (L,5)
-            X = block_scaled[np.newaxis, :, :]                                           # (1,L,5)
+            # 5-FEATURE MODEL
+            block = d[need_cols].tail(lookback).to_numpy()  # (L,5)
+            if _scaler_can_api(scaler):
+                block_scaled = scaler.transform(block)       # (L,5)
+            else:
+                scale_, min_ = _scaler_get_scale_min(scaler)
+                if scale_ is None or min_ is None or len(scale_) < len(FEATURE_COLS):
+                    st.warning("CNN-LSTM: scaler lacks transform and usable scale_/min_.")
+                    return None
+                block_scaled = block * scale_ + min_        # (L,5)
+            X = block_scaled[np.newaxis, :, :]              # (1,L,5)
     except Exception as e:
         st.warning(f"CNN-LSTM: failed to prepare input ({type(e).__name__}: {e}).")
         return None
@@ -379,34 +413,24 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
         st.warning(f"CNN-LSTM: predict failed ({type(e).__name__}: {e}).")
         return None
 
-    # Inverse-scale the close using the same 5-feature scaler
+    # Inverse transform the close
     try:
-        dummy = np.zeros((1, len(FEATURE_COLS)), dtype=float)
-        dummy[0, CLOSE_IDX] = y_scaled
-        y = float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+        if _scaler_can_api(scaler):
+            dummy = np.zeros((1, len(FEATURE_COLS)), dtype=float)
+            dummy[0, CLOSE_IDX] = y_scaled
+            y = float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+        else:
+            scale_, min_ = _scaler_get_scale_min(scaler)
+            if scale_ is None or min_ is None:
+                st.warning("CNN-LSTM: cannot invert close (no scale_/min_).")
+                return None
+            # From sklearn’s MinMaxScaler: y_scaled = X*scale_ + min_  =>  X = (y_scaled - min_)/scale_
+            y = float((y_scaled - min_[CLOSE_IDX]) / scale_[CLOSE_IDX])
         return y
     except Exception as e:
         st.warning(f"CNN-LSTM: inverse_transform failed ({type(e).__name__}: {e}).")
         return None
 
-
-
-
-def featurize(df: pd.DataFrame) -> pd.DataFrame:
-    out = _normalize_ohlcv(df)
-    if 'close' not in out.columns:
-        return pd.DataFrame()
-    out["MA10"] = out["close"].rolling(10).mean()
-    out["MA50"] = out["close"].rolling(50).mean()
-    return out.dropna()
-
-
-def fit_and_predict(df_features: pd.DataFrame) -> tuple[LinearRegression, float]:
-    X = df_features[["MA10", "MA50"]]
-    y = df_features["close"]
-    model = LinearRegression().fit(X, y)
-    pred = float(model.predict(df_features.iloc[[-1]][["MA10", "MA50"]])[0])
-    return model, pred
 
 
 # ---------- Sidebar / Controls ----------
