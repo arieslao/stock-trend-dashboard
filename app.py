@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import joblib
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import MinMaxScaler  # noqa: F401
 
 import streamlit as st
 
@@ -104,7 +103,6 @@ def _get_gsheet():
         return ws, getattr(creds, "service_account_email", "service-account")
     except Exception as e:
         return None, f"Auth/open failed: {e}"
-
 
 
 def append_prediction_rows(rows: List[Dict]):
@@ -291,146 +289,158 @@ def load_scaler():
             except Exception as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
-# ------ Added Helper to troubleshoot CNN-LTSM model ------
 
+# -------- Robust scaler utilities --------
 def _scaler_can_api(s) -> bool:
     return hasattr(s, "transform") and hasattr(s, "inverse_transform")
+
+def _dig(d: dict, *keys):
+    """Safely dig into nested dicts."""
+    cur = d
+    for k in keys:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return None
+    return cur
 
 def _scaler_get_scale_min(s):
     """
     Return (scale_, min_) as numpy arrays if available.
-    Works for real MinMaxScaler (attributes) or a dict persisted via joblib.
+    Supports:
+      - real MinMaxScaler (attrs)
+      - dict with scale_/min_
+      - dict with nested {"params": {...}} or {"state": {...}}
+      - dict with only data_min_/data_max_ (+feature_range) -> derive scale_/min_
     """
+    # Real sklearn scaler
     try:
         if hasattr(s, "scale_") and hasattr(s, "min_"):
             return np.asarray(s.scale_), np.asarray(s.min_)
-        if isinstance(s, dict):
-            if "scale_" in s and "min_" in s:
-                return np.asarray(s["scale_"]), np.asarray(s["min_"])
-            if "scale" in s and "min" in s:  # just in case
-                return np.asarray(s["scale"]), np.asarray(s["min"])
     except Exception:
         pass
+
+    # Dict forms (flat or nested)
+    if isinstance(s, dict):
+        for node in (s, _dig(s, "params"), _dig(s, "state")):
+            if isinstance(node, dict):
+                # Direct scale_/min_
+                if "scale_" in node and "min_" in node:
+                    return np.asarray(node["scale_"]), np.asarray(node["min_"])
+                if "scale" in node and "min" in node:
+                    return np.asarray(node["scale"]), np.asarray(node["min"])
+                # Derive from data_min_, data_max_, feature_range
+                dmin = node.get("data_min_")
+                dmax = node.get("data_max_")
+                drng = node.get("data_range_")
+                fr = node.get("feature_range", (0.0, 1.0))
+                if dmin is not None and (dmax is not None or drng is not None):
+                    dmin = np.asarray(dmin, dtype=float)
+                    if drng is None:
+                        dmax = np.asarray(dmax, dtype=float)
+                        drng = dmax - dmin
+                    else:
+                        drng = np.asarray(drng, dtype=float)
+                    fr0, fr1 = float(fr[0]), float(fr[1])
+                    scale_ = (fr1 - fr0) / drng
+                    min_ = fr0 - dmin * scale_
+                    return scale_, min_
+
     return None, None
 
 
+# ---------- Features + models ----------
+def featurize(df: pd.DataFrame) -> pd.DataFrame:
+    out = _normalize_ohlcv(df)
+    if 'close' not in out.columns:
+        return pd.DataFrame()
+    out["MA10"] = out["close"].rolling(10).mean()
+    out["MA50"] = out["close"].rolling(50).mean()
+    return out.dropna()
 
-def make_cnnlstm_input(df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
-    scaler = load_scaler()
-    if scaler is None:
-        return None, None
-    df_n = _normalize_ohlcv(df)
-    if not set(FEATURE_COLS).issubset(df_n.columns):
-        return None, None
-    if len(df_n) < lookback:
-        return None, None
-    block = df_n[FEATURE_COLS].tail(lookback).copy()
-    last_close = float(block["close"].iloc[-1])
+def fit_and_predict(df_features: pd.DataFrame) -> Optional[float]:
+    if df_features is None or df_features.empty:
+        return None
+    X = df_features[["MA10", "MA50"]]
+    y = df_features["close"]
     try:
-        scaled = scaler.transform(block.values)
+        model = LinearRegression().fit(X, y)
+        pred = float(model.predict(df_features.iloc[[-1]][["MA10", "MA50"]])[0])
+        return pred
     except Exception:
-        return None, None
-    X = scaled[np.newaxis, :, :]
-    return X, last_close
-
+        return None
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
     """
     Robust CNN-LSTM predictor that supports:
       • 5-feature OHLCV models, or
       • 1-feature (close-only) models
-    and works with either a real MinMaxScaler OR a dict with scale_/min_.
+    and works with either a real MinMaxScaler OR a dict with scale_/min_ (or data_min_/data_max_).
     """
     if tf is None:
-        st.warning("CNN-LSTM unavailable (TensorFlow missing).")
         return None
 
     model = load_cnn_lstm(symbol)
     if model is None:
-        st.warning("CNN-LSTM model not found on disk.")
         return None
 
     # Normalize + clean
-    d = df.copy()
-    if {'o','h','l','close','v'}.issubset(d.columns):
-        d = d.rename(columns={'o':'open','h':'high','l':'low','v':'volume'})
-    elif {'Open','High','Low','Close'}.issubset(d.columns):
-        d = d.rename(columns={'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'})
-    need_cols = ['open','high','low','close','volume']
-    if not set(need_cols).issubset(d.columns):
-        st.warning("CNN-LSTM: missing OHLCV columns.")
-        return None
-    d = d.dropna(subset=need_cols)
+    d = _normalize_ohlcv(df).dropna(subset=FEATURE_COLS)
     if len(d) < lookback:
-        st.warning(f"CNN-LSTM: not enough clean rows (have {len(d)}, need {lookback}).")
         return None
 
     scaler = load_scaler()
     if scaler is None:
-        st.warning("CNN-LSTM: scaler not loaded.")
         return None
 
-    # Model feature count
+    # Expected feature count
     try:
         n_feats = int(model.input_shape[-1])
     except Exception:
         n_feats = 5
 
+    scale_, min_ = _scaler_get_scale_min(scaler)
+
     try:
         if n_feats == 1:
-            # CLOSE-ONLY MODEL
-            # Build (1, L, 1) using scale_/min_ if we can; else try API
-            scale_, min_ = _scaler_get_scale_min(scaler)
             seq = d["close"].tail(lookback).to_numpy().reshape(-1, 1)  # (L,1)
             if scale_ is not None and min_ is not None:
                 X = (seq * scale_[CLOSE_IDX] + min_[CLOSE_IDX])[np.newaxis, :, :]  # (1,L,1)
             elif _scaler_can_api(scaler):
-                X = scaler.transform(seq)  # unlikely supported, but try
-                X = X[np.newaxis, :, :]
+                X = scaler.transform(seq)[np.newaxis, :, :]
             else:
-                st.warning("CNN-LSTM: scaler has neither API nor scale_/min_.")
                 return None
         else:
-            # 5-FEATURE MODEL
-            block = d[need_cols].tail(lookback).to_numpy()  # (L,5)
-            if _scaler_can_api(scaler):
-                block_scaled = scaler.transform(block)       # (L,5)
+            block = d[FEATURE_COLS].tail(lookback).to_numpy()  # (L,5)
+            if scale_ is not None and min_ is not None:
+                block_scaled = block * scale_ + min_
+            elif _scaler_can_api(scaler):
+                block_scaled = scaler.transform(block)
             else:
-                scale_, min_ = _scaler_get_scale_min(scaler)
-                if scale_ is None or min_ is None or len(scale_) < len(FEATURE_COLS):
-                    st.warning("CNN-LSTM: scaler lacks transform and usable scale_/min_.")
-                    return None
-                block_scaled = block * scale_ + min_        # (L,5)
-            X = block_scaled[np.newaxis, :, :]              # (1,L,5)
-    except Exception as e:
-        st.warning(f"CNN-LSTM: failed to prepare input ({type(e).__name__}: {e}).")
+                return None
+            X = block_scaled[np.newaxis, :, :]
+    except Exception:
         return None
 
     # Predict scaled close
     try:
         y_scaled = float(model.predict(X, verbose=0)[0][0])
-    except Exception as e:
-        st.warning(f"CNN-LSTM: predict failed ({type(e).__name__}: {e}).")
+    except Exception:
         return None
 
     # Inverse transform the close
     try:
-        if _scaler_can_api(scaler):
+        if scale_ is not None and min_ is not None:
+            # y_scaled = y*scale + min  => y = (y_scaled - min)/scale
+            return float((y_scaled - min_[CLOSE_IDX]) / scale_[CLOSE_IDX])
+        elif _scaler_can_api(scaler):
             dummy = np.zeros((1, len(FEATURE_COLS)), dtype=float)
             dummy[0, CLOSE_IDX] = y_scaled
-            y = float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
+            return float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
         else:
-            scale_, min_ = _scaler_get_scale_min(scaler)
-            if scale_ is None or min_ is None:
-                st.warning("CNN-LSTM: cannot invert close (no scale_/min_).")
-                return None
-            # From sklearn’s MinMaxScaler: y_scaled = X*scale_ + min_  =>  X = (y_scaled - min_)/scale_
-            y = float((y_scaled - min_[CLOSE_IDX]) / scale_[CLOSE_IDX])
-        return y
-    except Exception as e:
-        st.warning(f"CNN-LSTM: inverse_transform failed ({type(e).__name__}: {e}).")
+            return None
+    except Exception:
         return None
-
 
 
 # ---------- Sidebar / Controls ----------
@@ -466,10 +476,7 @@ def using_cnn() -> bool:
 
 # ---------- Auto-prime once per session ----------
 if not st.session_state.get("_session_primed", False):
-    # Set the flag FIRST so we don't loop even if something below fails
     st.session_state["_session_primed"] = True
-
-    # Prime once per session (ignore windows) so the table can render
     if watchlist:
         with st.spinner("Priming cache for your watchlist (one-time)…"):
             try:
@@ -478,27 +485,27 @@ if not st.session_state.get("_session_primed", False):
                 st.warning(f"Auto-prime skipped: {e}")
 
 
-
 # ---------- Diagnostics / Integrations ----------
 with st.expander("🔧 Diagnostics & Integrations", expanded=False):
     st.write("Now (PT):", now_la().strftime("%Y-%m-%d %H:%M:%S"))
     st.write("In window:", in_window())
     st.write("Next window (min):", seconds_until_next_window() // 60)
 
-    # Model + scaler status
     mdl = load_cnn_lstm()  # generic/all-symbol model
     st.write("CNN-LSTM loaded:", bool(mdl))
     if mdl:
         try:
-            st.write("Model input shape:", mdl.input_shape)  # -> (..., timesteps, features)
+            st.write("Model input shape:", mdl.input_shape)
             st.write("Model expects features:", mdl.input_shape[-1])
         except Exception:
             pass
 
     sc = load_scaler()
-    st.write("Scaler loaded:", bool(sc))
+    st.write("Scaler loaded:", sc is not None)
+    if isinstance(sc, dict):
+        # surface which keys exist so you can see what’s inside your saved scaler
+        st.write("Scaler keys:", list(sc.keys())[:12])
 
-    # Google Sheets
     ws, info = _get_gsheet()
     if ws is None:
         st.write("Google Sheets: not configured –", info)
@@ -518,7 +525,7 @@ with st.container():
         else:
             with st.spinner("Fetching fresh data…"):
                 prime_watchlist_cache(watchlist, days)
-            
+
 
 # ---------- Watchlist scoring / table ----------
 rows: List[Dict] = []
@@ -539,27 +546,25 @@ with st.spinner("Scoring watchlist…"):
 
             last_close = float(dN["close"].iloc[-1])
 
-            # Choose model per the selector
-            model_used_row = "Linear"
+            model_used_row = "—"
             next_pred = None
 
             if using_cnn():
                 next_pred = predict_next_close_cnnlstm(s, dN, lookback=DEFAULT_LOOKBACK)
                 if next_pred is not None:
                     model_used_row = "CNN-LSTM"
-                else:
-                    # fallback to Linear
-                    feat_row = featurize(dN)
-                    if not feat_row.empty:
-                        _, next_pred = fit_and_predict(feat_row)
-                        model_used_row = "Linear (fallback)"
-            else:
-                feat_row = featurize(dN)
-                if not feat_row.empty:
-                    _, next_pred = fit_and_predict(feat_row)
 
             if next_pred is None:
-                raise RuntimeError("prediction failed")
+                feat_row = featurize(dN)
+                lin_pred = fit_and_predict(feat_row)
+                if lin_pred is not None:
+                    next_pred = lin_pred
+                    model_used_row = "Linear (fallback)"
+
+            if next_pred is None:
+                # Last resort so the table always fills (0% change)
+                next_pred = last_close
+                model_used_row = "Naive"
 
             ret = 100.0 * (float(next_pred) - last_close) / last_close
             signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
