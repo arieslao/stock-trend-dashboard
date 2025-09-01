@@ -1,0 +1,37 @@
+name: EOD Model Compare Log
+
+on:
+  schedule:
+    # ~1:10 PM Pacific (handles DST roughly; Mon–Fri)
+    - cron: "10 20 * 3-11 1-5"   # Mar–Nov
+    - cron: "10 21 * 1,2,12 1-5" # Dec–Feb
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas==2.2.2 numpy==1.26.4 joblib==1.4.2 \
+                     yfinance==0.2.44 requests==2.32.3 \
+                     gspread==6.1.2 google-auth==2.33.0 \
+                     tensorflow-cpu==2.15.0
+
+      - name: Run comparison logger
+        env:
+          GOOGLE_SHEETS_SHEET_ID: ${{ secrets.GOOGLE_SHEETS_SHEET_ID }}
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+          WATCHLIST: ${{ vars.WATCHLIST || 'AAPL,MSFT,GOOGL,TSLA' }}
+          DAYS_HISTORY: ${{ vars.DAYS_HISTORY || '180' }}
+          COMPARE_SHEET: ${{ vars.COMPARE_SHEET || 'model_compare' }}
+        run: |
+          python log_eod_compare.py
