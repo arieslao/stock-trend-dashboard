@@ -41,34 +41,47 @@ except Exception:
 
 @st.cache_resource(show_spinner=False)
 def _get_gsheet():
-    """Return (worksheet, account_email) or (None, message)."""
+    """Return (worksheet, account_email) or (None, message). Supports two secrets styles:
+       1) GOOGLE_SHEETS_JSON  (recommended: full Google JSON as-is)
+       2) [gcp_service_account]  (TOML table with the same fields)
+       Sheet id may be in GOOGLE_SHEETS_SHEET_ID or [gsheets].sheet_id.
+    """
     if not (gspread and Credentials):
         return None, "gspread / google-auth not installed"
 
-    sheet_id = (
-        st.secrets.get("GOOGLE_SHEETS_SHEET_ID")
-        if hasattr(st, "secrets") else None
-    ) or os.getenv("GOOGLE_SHEETS_SHEET_ID")
+    # ---- sheet id ----
+    sheet_id = None
+    if hasattr(st, "secrets"):
+        sheet_id = (
+            st.secrets.get("GOOGLE_SHEETS_SHEET_ID")
+            or (st.secrets.get("gsheets", {}) or {}).get("sheet_id")
+        )
+    sheet_id = sheet_id or os.getenv("GOOGLE_SHEETS_SHEET_ID")
+    if not sheet_id:
+        return None, "Missing GOOGLE_SHEETS_SHEET_ID"
 
+    # ---- credentials ----
     creds_info = None
     if hasattr(st, "secrets"):
-        if "gcp_service_account" in st.secrets:
-            creds_info = st.secrets["gcp_service_account"]
-        elif "GOOGLE_SHEETS_JSON" in st.secrets:
+        if "GOOGLE_SHEETS_JSON" in st.secrets:  # full JSON as a string
             try:
                 creds_info = json.loads(st.secrets["GOOGLE_SHEETS_JSON"])
             except Exception:
-                pass
+                return None, "GOOGLE_SHEETS_JSON is not valid JSON"
+        elif "gcp_service_account" in st.secrets:  # TOML table
+            creds_info = dict(st.secrets["gcp_service_account"])
     if creds_info is None and os.getenv("GOOGLE_SHEETS_JSON"):
         try:
             creds_info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
         except Exception:
-            pass
+            return None, "Env GOOGLE_SHEETS_JSON is not valid JSON"
 
-    if not sheet_id:
-        return None, "Missing GOOGLE_SHEETS_SHEET_ID"
     if not creds_info:
-        return None, "Missing service account JSON"
+        return None, "Missing service account JSON (GOOGLE_SHEETS_JSON or [gcp_service_account])"
+
+    # Normalize the private key (common copy/paste issue)
+    if "private_key" in creds_info and isinstance(creds_info["private_key"], str):
+        creds_info["private_key"] = creds_info["private_key"].strip()
 
     try:
         scopes = [
@@ -82,12 +95,16 @@ def _get_gsheet():
             ws = sh.worksheet("logs")
         except Exception:
             ws = sh.sheet1
+
+        # ensure header row
         values = ws.get_all_values()
-        if not values or (values and values[0] != LOG_COLUMNS):
+        if not values or values[0] != LOG_COLUMNS:
             ws.update("A1", [LOG_COLUMNS])
+
         return ws, getattr(creds, "service_account_email", "service-account")
     except Exception as e:
         return None, f"Auth/open failed: {e}"
+
 
 
 def append_prediction_rows(rows: List[Dict]):
@@ -435,12 +452,28 @@ with st.expander("🔧 Diagnostics & Integrations", expanded=False):
     st.write("Now (PT):", now_la().strftime("%Y-%m-%d %H:%M:%S"))
     st.write("In window:", in_window())
     st.write("Next window (min):", seconds_until_next_window() // 60)
-    st.write("CNN-LSTM model file:", st.session_state.get("cnn_model_path"))
+
+    # Model + scaler status
+    mdl = load_cnn_lstm()  # generic/all-symbol model
+    st.write("CNN-LSTM loaded:", bool(mdl))
+    if mdl:
+        try:
+            st.write("Model input shape:", mdl.input_shape)  # -> (..., timesteps, features)
+            st.write("Model expects features:", mdl.input_shape[-1])
+        except Exception:
+            pass
+
+    sc = load_scaler()
+    st.write("Scaler loaded:", bool(sc))
+
+    # Google Sheets
     ws, info = _get_gsheet()
     if ws is None:
         st.write("Google Sheets: not configured –", info)
     else:
         st.write("Google Sheets: connected ✅  (worksheet:", ws.title, ")")
+        st.write("Share this sheet with:", info)
+
 
 # ---------- Refresh watchlist (ad-hoc) ----------
 with st.container():
