@@ -1,0 +1,52 @@
+name: Retrain CNN-LSTM (weekly)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Fridays ~ 1:30 PM PT (script has its own after-close PT gate)
+    - cron: "30 21 * * 5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: retrain-cnnlstm
+  cancel-in-progress: true
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps (minimal + TF CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy==1.26.4 pandas==2.2.2 scikit-learn==1.4.2 joblib==1.4.2 yfinance==0.2.44 requests==2.32.3
+          pip install "tensorflow==2.15.0"
+
+      - name: Retrain/Fine-tune CNN-LSTM
+        env:
+          LOOKBACK: "60"
+          EPOCHS: "5"
+          BATCH: "32"
+        run: |
+          python scripts/retrain_cnn_lstm.py --days ${DAYS:-420}
+
+      - name: Commit model + scaler if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: update cnn_lstm_ALL.keras & scaler_ALL.pkl [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
