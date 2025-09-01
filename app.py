@@ -14,7 +14,7 @@ except Exception:
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LinearRegression  # kept for type hints / compatibility
 
 import streamlit as st
 
@@ -22,6 +22,10 @@ import streamlit as st
 FEATURE_COLS = ["open", "high", "low", "close", "volume"]
 CLOSE_IDX = FEATURE_COLS.index("close")
 DEFAULT_LOOKBACK = 60  # sequence length for CNN-LSTM
+
+# Yahoo Finance request bits (centralized)
+YH_URL_BASE = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YH_HEADERS_DEFAULT = {"User-Agent": "Mozilla/5.0"}
 
 LOG_COLUMNS = [
     "ts_utc", "ts_pt", "symbol", "model", "lookback",
@@ -65,14 +69,14 @@ def _get_gsheet():
         if "GOOGLE_SHEETS_JSON" in st.secrets:  # full JSON as a string
             try:
                 creds_info = json.loads(st.secrets["GOOGLE_SHEETS_JSON"])
-            except Exception:
+            except json.JSONDecodeError:
                 return None, "GOOGLE_SHEETS_JSON is not valid JSON"
         elif "gcp_service_account" in st.secrets:  # TOML table
             creds_info = dict(st.secrets["gcp_service_account"])
     if creds_info is None and os.getenv("GOOGLE_SHEETS_JSON"):
         try:
             creds_info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
-        except Exception:
+        except json.JSONDecodeError:
             return None, "Env GOOGLE_SHEETS_JSON is not valid JSON"
 
     if not creds_info:
@@ -92,7 +96,7 @@ def _get_gsheet():
         sh = client.open_by_key(sheet_id)
         try:
             ws = sh.worksheet("logs")
-        except Exception:
+        except gspread.exceptions.WorksheetNotFound:
             ws = sh.sheet1
 
         # ensure header row
@@ -101,7 +105,9 @@ def _get_gsheet():
             ws.update("A1", [LOG_COLUMNS])
 
         return ws, getattr(creds, "service_account_email", "service-account")
-    except Exception as e:
+    except (gspread.exceptions.APIError,
+            gspread.exceptions.SpreadsheetNotFound,
+            OSError, ValueError) as e:
         return None, f"Auth/open failed: {e}"
 
 
@@ -112,7 +118,8 @@ def append_prediction_rows(rows: List[Dict]):
     payload = [[r.get(k, "") for k in LOG_COLUMNS] for r in rows]
     try:
         ws.append_rows(payload, value_input_option="RAW")
-    except Exception:
+    except (gspread.exceptions.APIError, ValueError, TypeError):
+        # Log append errors are non-fatal to the app
         pass
 
 
@@ -159,36 +166,44 @@ def seconds_until_next_window() -> int:
 
 
 # ---------- Yahoo fetchers ----------
-YH_HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-
 @st.cache_data(ttl=600)
 def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> pd.DataFrame:
     if not ignore_windows and not in_window():
         raise RuntimeError("Outside fetch window")
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+    url = YH_URL_BASE.format(symbol=symbol)
     params = {"interval": "1d", "range": f"{days}d"}
-    r = requests.get(url, params=params, headers=YH_HEADERS, timeout=15)
-    r.raise_for_status()
-    j = r.json()
+
+    try:
+        r = requests.get(url, params=params, headers=YH_HEADERS_DEFAULT, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        raise RuntimeError(f"Yahoo request failed: {e}") from e
+
     result = (j.get("chart", {}) or {}).get("result") or []
     if not result:
         raise RuntimeError("Yahoo candles: empty result")
+
     res = result[0]
     ts = res.get("timestamp")
     q = (res.get("indicators", {}) or {}).get("quote", [{}])[0]
     if not ts or not q:
         raise RuntimeError("Yahoo candles: missing keys")
-    df = pd.DataFrame({
-        "time": pd.to_datetime(ts, unit="s"),
-        "o": q.get("open"),
-        "h": q.get("high"),
-        "l": q.get("low"),
-        "close": q.get("close"),
-        "v": q.get("volume"),
-    }).dropna()
-    df.set_index("time", inplace=True)
-    return df[["o", "h", "l", "close", "v"]]
+
+    try:
+        df = pd.DataFrame({
+            "time": pd.to_datetime(ts, unit="s"),
+            "o": q.get("open"),
+            "h": q.get("high"),
+            "l": q.get("low"),
+            "close": q.get("close"),
+            "v": q.get("volume"),
+        }).dropna()
+        df.set_index("time", inplace=True)
+        return df[["o", "h", "l", "close", "v"]]
+    except (KeyError, ValueError, TypeError) as e:
+        raise RuntimeError(f"Yahoo candles: parse error: {e}") from e
 
 
 # ---------- History cache helpers ----------
@@ -226,7 +241,8 @@ def fetch_history(symbol: str, days: int, *, allow_live_fallback: bool = True) -
         df2 = get_candles(symbol, days=days)  # may raise if outside window
         if df2 is not None and not df2.empty:
             return _put_cache(symbol, df2)
-    except Exception:
+    except (RuntimeError, requests.exceptions.RequestException,
+            ValueError, KeyError):
         pass
 
     if allow_live_fallback and not st.session_state.get(f"_once_live_{symbol}", False):
@@ -235,7 +251,8 @@ def fetch_history(symbol: str, days: int, *, allow_live_fallback: bool = True) -
             st.session_state[f"_once_live_{symbol}"] = True
             if df3 is not None and not df3.empty:
                 return _put_cache(symbol, df3)
-        except Exception:
+        except (RuntimeError, requests.exceptions.RequestException,
+                ValueError, KeyError):
             st.session_state[f"_once_live_{symbol}"] = True
 
     return None
@@ -250,7 +267,8 @@ def prime_watchlist_cache(symbols: list[str], days: int) -> list[str]:
             if df is not None and not df.empty:
                 _put_cache(s, df)
                 ok.append(s)
-        except Exception:
+        except (RuntimeError, requests.exceptions.RequestException,
+                ValueError, KeyError):
             pass
     return ok
 
@@ -270,12 +288,11 @@ def load_cnn_lstm(symbol: Optional[str] = None):
                 model = tf.keras.models.load_model(p)
                 st.session_state["cnn_model_path"] = str(p)
                 return model
-            except Exception as e:
+            except (OSError, IOError, ValueError) as e:
                 st.warning(f"Found {p.name} but failed to load model: {e}")
     return None
 
 
-@st.cache_resource(show_spinner=False)
 @st.cache_resource(show_spinner=False)
 def load_scaler():
     for p in [
@@ -290,10 +307,23 @@ def load_scaler():
                 if isinstance(obj, dict) and "scaler" in obj:
                     obj = obj["scaler"]
                 return obj
-            except Exception as e:
+            except (OSError, IOError, ValueError) as e:
                 st.warning(f"Found {p.name} but failed to load scaler: {e}")
     return None
 
+
+@st.cache_resource(show_spinner=False)
+def load_linear_model():
+    """Load a pre-trained LinearRegression model once."""
+    for p in [Path("models") / "linear_model.pkl", Path("linear_model.pkl")]:
+        if p.exists():
+            try:
+                return joblib.load(p)
+            except (OSError, IOError, ValueError) as e:
+                st.warning(f"Failed to load linear model from {p.name}: {e}")
+                return None
+    # Not fatal, just means Linear fallback won't run
+    return None
 
 
 # -------- Robust scaler utilities --------
@@ -364,17 +394,24 @@ def featurize(df: pd.DataFrame) -> pd.DataFrame:
     out["MA50"] = out["close"].rolling(50).mean()
     return out.dropna()
 
+
 def fit_and_predict(df_features: pd.DataFrame) -> Optional[float]:
+    """Predict with a pre-trained LinearRegression saved as linear_model.pkl."""
     if df_features is None or df_features.empty:
         return None
-    X = df_features[["MA10", "MA50"]]
-    y = df_features["close"]
-    try:
-        model = LinearRegression().fit(X, y)
-        pred = float(model.predict(df_features.iloc[[-1]][["MA10", "MA50"]])[0])
-        return pred
-    except Exception:
+    model = load_linear_model()
+    if model is None:
+        # Informative but non-fatal
+        st.info("Linear model file not found (models/linear_model.pkl).")
         return None
+    try:
+        x_last = df_features.iloc[[-1]][["MA10", "MA50"]]
+        pred = float(model.predict(x_last)[0])
+        return pred
+    except (KeyError, ValueError) as e:
+        st.warning(f"Linear predict failed: {e}")
+        return None
+
 
 def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
     """
@@ -425,13 +462,13 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
             else:
                 return None
             X = block_scaled[np.newaxis, :, :]
-    except Exception:
+    except (ValueError, KeyError, TypeError):
         return None
 
     # Predict scaled close
     try:
         y_scaled = float(model.predict(X, verbose=0)[0][0])
-    except Exception:
+    except (ValueError, TypeError) as e:
         return None
 
     # Inverse transform the close
@@ -445,7 +482,7 @@ def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DE
             return float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
         else:
             return None
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -487,10 +524,8 @@ if not st.session_state.get("_session_primed", False):
         with st.spinner("Priming cache for your watchlist (one-time)…"):
             try:
                 prime_watchlist_cache(watchlist, days)
-            except Exception as e:
+            except (RuntimeError, requests.exceptions.RequestException) as e:
                 st.warning(f"Auto-prime skipped: {e}")
-
-
 
 
 # ---------- Diagnostics / Integrations ----------
@@ -512,7 +547,11 @@ with st.expander("🔧 Diagnostics & Integrations", expanded=False):
     # Scaler status
     sc = load_scaler()
     st.write("Scaler loaded:", bool(sc))
-    st.write("Scaler is MinMaxScaler:", hasattr(sc, "transform") and hasattr(sc, "inverse_transform"))
+    st.write("Scaler has API:", hasattr(sc, "transform") and hasattr(sc, "inverse_transform"))
+
+    # Linear model status
+    lin = load_linear_model()
+    st.write("Linear model loaded:", bool(lin))
 
     # Google Sheets
     ws, info = _get_gsheet()
@@ -522,9 +561,6 @@ with st.expander("🔧 Diagnostics & Integrations", expanded=False):
         st.write("Google Sheets: connected ✅")
         st.write("Worksheet:", ws.title)
         st.write("Service account:", info)
-
-
-
 
 
 # ---------- Refresh watchlist (ad-hoc) ----------
@@ -555,7 +591,7 @@ with st.spinner("Scoring watchlist…"):
 
             dN = _normalize_ohlcv(d)
             if "close" not in dN.columns:
-                raise RuntimeError("missing close")
+                raise KeyError("missing 'close'")
 
             last_close = float(dN["close"].iloc[-1])
 
@@ -590,7 +626,8 @@ with st.spinner("Scoring watchlist…"):
                 "Signal": signal,
                 "Model": model_used_row
             })
-        except Exception:
+        except (RuntimeError, KeyError, ValueError,
+                requests.exceptions.RequestException):
             rows.append({
                 "Symbol": s,
                 "Last": None, "Predicted": None, "Δ%": None,
@@ -625,7 +662,7 @@ if rows:
             })
         if to_log:
             append_prediction_rows(to_log)
-    except Exception:
+    except (gspread.exceptions.APIError, ValueError, TypeError):
         pass
 else:
     st.info("Your watchlist is empty. Add symbols in the sidebar.")
