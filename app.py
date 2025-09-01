@@ -144,6 +144,50 @@ def seconds_until_next_window() -> int:
     return max(0, int((min(candidates) - t).total_seconds()))
 
 
+
+# --------- Fetch all symbols in one shot -----
+
+def prime_watchlist_cache(symbols: list[str], days: int) -> None:
+    """Fetch candles (and quotes) for all symbols at once and cache them."""
+    st.session_state.setdefault("history_cache", {})
+    st.session_state.setdefault("quote_cache", {})
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    ok, fail = [], []
+    for i, s in enumerate(symbols):
+        status.write(f"Fetching {s} …")
+        try:
+            # Live fetch once, ignoring the time windows
+            d = get_candles(s, days=days, ignore_windows=True)
+            if d is None or d.empty:
+                raise RuntimeError("empty history")
+            st.session_state["history_cache"][s] = d
+
+            try:
+                q = get_quote(s, ignore_windows=True)
+                st.session_state["quote_cache"][s] = q
+            except Exception:
+                # quote failure shouldn't block history
+                pass
+
+            ok.append(s)
+        except Exception as e:
+            fail.append(f"{s} ({e})")
+        finally:
+            progress.progress(int((i + 1) / max(1, len(symbols)) * 100))
+
+    status.empty()
+    progress.empty()
+
+    if ok:
+        st.success(f"Cached {len(ok)} symbols: {', '.join(ok)}")
+    if fail:
+        st.warning("Some failed: " + ", ".join(fail))
+
+
+
 # ---------- Yahoo fetchers ----------
 YH_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -340,6 +384,25 @@ if watchlist and st.session_state["focus_symbol"] not in watchlist:
 focus = st.session_state["focus_symbol"]
 
 
+
+# Auto-prime the cache once when outside the window (only if needed)
+if not in_window() and not st.session_state.get("_auto_primed", False):
+    need = [s for s in (watchlist or []) 
+            if s not in st.session_state.get("history_cache", {})]
+
+    if need:
+        with st.expander("Auto-priming cache (outside fetch window)", expanded=False):
+            with st.spinner("Fetching initial data for your watchlist…"):
+                prime_watchlist_cache(need, days)  # <- helper you added earlier
+        st.session_state["_auto_primed"] = True
+        st.rerun()
+    else:
+        # Nothing to do, but mark so we don't re-check on every run
+        st.session_state["_auto_primed"] = True
+
+
+
+
 # ---------- Diagnostics ----------
 with st.expander("🛠️ Diagnostics", expanded=False):
     st.write("Python:", st.__version__ if hasattr(st, "__version__") else "—")
@@ -482,26 +545,17 @@ with col2:
 
 # ---------- Refresh watchlist (live) ----------
 with st.container():
-    if st.button("🔄 Refresh watchlist (live fetch once)",
-                 help="Fetch all symbols now, ignoring fetch windows."):
-        st.session_state.setdefault("history_cache", {})
-        st.session_state.setdefault("quote_cache", {})
-        refreshed = []
-        for s in watchlist:
-            try:
-                d = get_candles(s, days=days, ignore_windows=True)
-                st.session_state["history_cache"][s] = d
-                try:
-                    q = get_quote(s, ignore_windows=True)
-                    st.session_state["quote_cache"][s] = q
-                except Exception:
-                    pass
-                refreshed.append(s)
-            except Exception as e:
-                st.warning(f"{s}: {e}")
-        if refreshed:
-            st.success(f"Refreshed: {', '.join(refreshed)}")
+    if st.button(
+        "🔄 Refresh watchlist (live fetch ALL now)",
+        help="Fetch fresh candles & quotes for every symbol once, ignoring the time windows."
+    ):
+        if not watchlist:
+            st.info("Your watchlist is empty.")
+        else:
+            with st.spinner("Priming cache for all symbols…"):
+                prime_watchlist_cache(watchlist, days)
             st.rerun()
+
 
 # ---------- Watchlist (click the ticker to focus) ----------
 rows = []
