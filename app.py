@@ -443,6 +443,7 @@ with st.expander("🛠️ Diagnostics", expanded=False):
     st.write("Next window in (min):", seconds_until_next_window() // 60)
 
     colA, colB = st.columns(2)
+
     with colA:
         if st.button("Force one-time LIVE fetch & cache for focus symbol"):
             try:
@@ -456,21 +457,7 @@ with st.expander("🛠️ Diagnostics", expanded=False):
                 st.success(f"Cached {len(df_live)} rows for {symbol} (Yahoo).")
             except Exception as e:
                 st.error(f"Force fetch failed: {e}")
-                #--- adding code so the cache stores/reads by focus ---
-                df_live = get_candles(focus, days=days, ignore_windows=True)
-                st.session_state.setdefault("history_cache", {})[focus] = df_live
-                # --- end code addition ---
-try:
-    px_live = get_quote(focus, ignore_windows=True)
-    st.session_state.setdefault("quote_cache", {})[focus] = px_live
-except Exception as qe:
-    st.warning(f"Quote prime failed (but history cached): {qe}")
 
-st.success(f"Cached {len(df_live)} rows for {focus} (Yahoo).")
-
-
-
-    
     with colB:
         if st.button("Test history fetch (AAPL, 30d)"):
             try:
@@ -480,8 +467,9 @@ st.success(f"Cached {len(df_live)} rows for {focus} (Yahoo).")
             except Exception as e:
                 st.error(f"History test failed: {e}")
 
+# (optional) separate expander just to show model file status
 with st.expander("🔎 CNN-LSTM status", expanded=False):
-    st.write("Model file:", st.session_state.get("cnn_model_path", "None"))
+    st.write("Model file:", st.session_state.get("cnn_model_path"))
 
     # --- google sheets status  ---
     ws, info = _get_gsheet()
