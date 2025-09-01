@@ -368,11 +368,16 @@ def using_cnn() -> bool:
 # ---------- Auto-prime once per session ----------
 # Runs ONLY on the first load for this user session (regardless of window).
 if not st.session_state.get("_session_primed", False):
+    # mark first so we never loop even if something below errors
+    st.session_state["_session_primed"] = True
+
     if watchlist:
         with st.spinner("Priming cache for your watchlist (one-time)…"):
-            prime_watchlist_cache(watchlist, days)  # ignore windows, fetch once
-    st.session_state["_session_primed"] = True
-    st.rerun()
+            try:
+                prime_watchlist_cache(watchlist, days)  # ignore windows, fetch once
+            except Exception as e:
+                st.warning(f"Auto-prime skipped: {e}")
+
 
 # ---------- Diagnostics / Integrations ----------
 with st.expander("🔧 Diagnostics & Integrations", expanded=False):
@@ -397,7 +402,7 @@ with st.container():
         else:
             with st.spinner("Fetching fresh data…"):
                 prime_watchlist_cache(watchlist, days)
-            st.rerun()
+            
 
 # ---------- Watchlist scoring / table ----------
 rows: List[Dict] = []
