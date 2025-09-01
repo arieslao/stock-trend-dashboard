@@ -286,7 +286,7 @@ def load_scaler():
         if p.exists():
             try:
                 obj = joblib.load(p)
-                # NEW: unwrap if your joblib file is {"scaler": <MinMaxScaler>, "feats": [...]}
+                # unwrap common structure: {"scaler": <MinMaxScaler>, "feats": [...]}
                 if isinstance(obj, dict) and "scaler" in obj:
                     obj = obj["scaler"]
                 return obj
