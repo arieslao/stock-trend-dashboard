@@ -366,17 +366,18 @@ def using_cnn() -> bool:
 
 
 # ---------- Auto-prime once per session ----------
-# Runs ONLY on the first load for this user session (regardless of window).
 if not st.session_state.get("_session_primed", False):
-    # mark first so we never loop even if something below errors
+    # Set the flag FIRST so we don't loop even if something below fails
     st.session_state["_session_primed"] = True
 
+    # Prime once per session (ignore windows) so the table can render
     if watchlist:
         with st.spinner("Priming cache for your watchlist (one-time)…"):
             try:
-                prime_watchlist_cache(watchlist, days)  # ignore windows, fetch once
+                prime_watchlist_cache(watchlist, days)
             except Exception as e:
                 st.warning(f"Auto-prime skipped: {e}")
+
 
 
 # ---------- Diagnostics / Integrations ----------
