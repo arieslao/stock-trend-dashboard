@@ -325,6 +325,13 @@ def load_linear_model():
     # Not fatal, just means Linear fallback won't run
     return None
 
+def predict_linear(df_features: pd.DataFrame):
+    mdl = load_linear_model()
+    if mdl is None or df_features.empty:
+        return Non
+        X_last = df_features.iloc[[-1]][["MA10","MA50"]].to_numpy(dtype=float)
+        return float(mdl.predict(X_last)[0])
+
 
 # -------- Robust scaler utilities --------
 def _scaler_can_api(s) -> bool:
