@@ -1,47 +1,95 @@
 name: Retrain Linear (daily)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # Run weekdays ~ 1:15 PM PT (DST-safe because script gates by PT time)
-    - cron: "15 21 * * 1-5"  # 21:15 UTC ≈ 13:15 PT (PDT/PST varies; script double-checks)
-
-permissions:
-  contents: write  # allow commit of model file
-
-concurrency:
-  group: retrain-linear
-  cancel-in-progress: true
+    # Runs every day at 08:15 UTC; adjust if you want
+    - cron: "15 8 * * *"
+  workflow_dispatch: {}
 
 jobs:
   train:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install deps (minimal)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy==1.26.4 pandas==2.2.2 scikit-learn==1.4.2 joblib==1.4.2 yfinance==0.2.44 requests==2.32.3
-
-      - name: Retrain linear model (after-close gate inside)
-        run: |
-          python scripts/retrain_linear.py --days ${DAYS:-365} --out models/linear_model.pkl
-
-      - name: Commit model if changed
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add models/linear_model.pkl
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: update linear_model.pkl [skip ci]"
-            git push
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           else
-            echo "No changes to commit."
+            # Fallback in case requirements.txt is missing
+            pip install google-auth gspread pandas numpy scikit-learn
           fi
+
+      - name: Create service account JSON file
+        env:
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        run: |
+          set -euxo pipefail
+          echo "$GOOGLE_SHEETS_JSON" > $RUNNER_TEMP/sa.json
+          python - <<'PY'
+import json, os
+p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
+json.load(open(p))
+print("Service account JSON OK:", p)
+PY
+
+      - name: Quick environment debug
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          set -euxo pipefail
+          python -V
+          pip list | sed -n '1,80p'
+          echo "SHEET_ID length: ${#SHEET_ID:-0}"
+
+      - name: Sanity write to Google Sheet (proves auth + sharing)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          python - <<'PY'
+import os, gspread
+sheet_id = os.environ["SHEET_ID"]
+gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+sh = gc.open_by_key(sheet_id)
+try:
+    ws = sh.worksheet("Test Watchlist")
+except Exception:
+    ws = sh.add_worksheet(title="Test Watchlist", rows=1000, cols=26)
+ws.append_row(["CI smoke test", "ok"])
+print("Wrote a row to 'Test Watchlist'")
+PY
+
+      - name: Show train.py help (so we see required flags)
+        run: |
+          python train.py --help || true
+
+      - name: Train (Linear) and write results
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: |
+          set -euxo pipefail
+          # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          # If your script uses DIFFERENT flag names, watch the --help output
+          # from the previous step and edit this command accordingly.
+          # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          python train.py \
+            --model linear \
+            --sheet-id "$SHEET_ID" \
+            --worksheet "Test Watchlist"
+
+      - name: Success message
+        run: echo "Retrain Linear finished successfully."
