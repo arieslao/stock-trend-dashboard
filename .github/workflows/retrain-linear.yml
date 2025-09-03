@@ -2,8 +2,7 @@ name: Retrain Linear (daily)
 
 on:
   schedule:
-    # Runs every day at 08:15 UTC; adjust if you want
-    - cron: "15 8 * * *"
+    - cron: "15 8 * * *"   # daily 08:15 UTC
   workflow_dispatch: {}
 
 jobs:
@@ -27,7 +26,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # Fallback in case requirements.txt is missing
             pip install google-auth gspread pandas numpy scikit-learn
           fi
 
@@ -36,13 +34,14 @@ jobs:
           GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
         run: |
           set -euxo pipefail
-          echo "$GOOGLE_SHEETS_JSON" > $RUNNER_TEMP/sa.json
+          echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
+          # Validate that the JSON parses (helps catch bad pasting/quoting)
           python - <<'PY'
-import json, os
-p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
-json.load(open(p))
-print("Service account JSON OK:", p)
-PY
+          import json, os
+          p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
+          json.load(open(p))
+          print("Service account JSON OK:", p)
+          PY
 
       - name: Quick environment debug
         env:
@@ -59,19 +58,18 @@ PY
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: |
           python - <<'PY'
-import os, gspread
-sheet_id = os.environ["SHEET_ID"]
-gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-sh = gc.open_by_key(sheet_id)
-try:
-    ws = sh.worksheet("Test Watchlist")
-except Exception:
-    ws = sh.add_worksheet(title="Test Watchlist", rows=1000, cols=26)
-ws.append_row(["CI smoke test", "ok"])
-print("Wrote a row to 'Test Watchlist'")
-PY
+          import os, gspread
+          gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+          sh = gc.open_by_key(os.environ["SHEET_ID"])
+          try:
+              ws = sh.worksheet("Test Watchlist")
+          except Exception:
+              ws = sh.add_worksheet(title="Test Watchlist", rows=1000, cols=26)
+          ws.append_row(["CI smoke test", "ok"])
+          print("Wrote a row to 'Test Watchlist'")
+          PY
 
-      - name: Show train.py help (so we see required flags)
+      - name: Show train.py help (to confirm flag names)
         run: |
           python train.py --help || true
 
@@ -82,10 +80,7 @@ PY
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
         run: |
           set -euxo pipefail
-          # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-          # If your script uses DIFFERENT flag names, watch the --help output
-          # from the previous step and edit this command accordingly.
-          # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          # If your script uses different flag names, update these
           python train.py \
             --model linear \
             --sheet-id "$SHEET_ID" \
