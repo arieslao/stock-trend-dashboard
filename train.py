@@ -10,6 +10,7 @@ import joblib
 import gspread
 import argparse # New import for command-line arguments
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.linear_model import LinearRegression
 
 # --- Constants ---
 WINDOW = 60
