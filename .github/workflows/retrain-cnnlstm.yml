@@ -1,52 +1,35 @@
-name: Retrain CNN-LSTM (weekly)
+name: Nightly CNN-LSTM Train
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # Fridays ~ 1:30 PM PT (script has its own after-close PT gate)
-    - cron: "30 21 * * 5"
+    - cron: "30 2 * * *"   # 02:30 UTC daily (10:30 AM Manila, UTC+8)
+  workflow_dispatch: {}     # lets you run it manually from the UI
 
 permissions:
   contents: write
-
-concurrency:
-  group: retrain-cnnlstm
-  cancel-in-progress: true
 
 jobs:
   train:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install deps (minimal + TF CPU)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install numpy==1.26.4 pandas==2.2.2 scikit-learn==1.4.2 joblib==1.4.2 yfinance==0.2.44 requests==2.32.3
-          pip install "tensorflow==2.15.0"
+          pip install tensorflow-cpu==2.15.* pandas numpy yfinance scikit-learn joblib gspread oauth2client
 
-      - name: Retrain/Fine-tune CNN-LSTM
-        env:
-          LOOKBACK: "60"
-          EPOCHS: "5"
-          BATCH: "32"
-        run: |
-          python scripts/retrain_cnn_lstm.py --days ${DAYS:-420}
+      - name: Train
+        run: python train.py
 
-      - name: Commit model + scaler if changed
+      - name: Commit model artifacts
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl
-          if ! git diff --cached --quiet; then
-            git commit -m "ci: update cnn_lstm_ALL.keras & scaler_ALL.pkl [skip ci]"
-            git push
-          else
-            echo "No changes to commit."
-          fi
+          git commit -m "Update CNN-LSTM model artifacts" || echo "No changes to commit"
+          git push
