@@ -223,8 +223,8 @@ def train_and_eval(X, y):
     return model, scaler, preds, y_test
 
 # --- Quick Debug Print ---
-print("[DEBUG] columns:", list(data.columns)[:20])
-print("[DEBUG] has Target?", "Target" in data.columns)
+#print("[DEBUG] columns:", list(data.columns)[:20])
+#print("[DEBUG] has Target?", "Target" in data.columns)
 
 
 # ----------------------------
