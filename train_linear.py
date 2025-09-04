@@ -135,7 +135,7 @@ def add_features(df):
     rs = up.rolling(roll).mean() / dn.rolling(roll).mean()
     df["RSI14"] = 100 - (100 / (1 + rs))
     # Target: next-day Close
-    df["Target_Close_h1"] = close.shift(-1)
+    df["Target"] = close.shift(-1)
     return df
 
 def build_dataset(tickers, lookback_days, interval, horizon=1):
@@ -157,7 +157,7 @@ def build_dataset(tickers, lookback_days, interval, horizon=1):
     # Keep rows with complete features and target
     feature_cols = [c for c in data.columns if c.startswith(("Lag","SMA","STD","RSI","Return1"))]
     X = data[feature_cols]
-    y = data["Target_Close_h1"]
+    y = data["Target"]
     mask = X.notna().all(axis=1) & y.notna()
     X = X[mask]
     y = y[mask]
