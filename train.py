@@ -1,8 +1,8 @@
 # train.py — nightly trainer for CNN-LSTM (multi-horizon)
 # Primary data: Stooq (free, stable). Fallback: yfinance with retries.
-# Reads tickers from Google Sheets.
+# Reads tickers from Google Sheets. Includes EarlyStopping & CLI flags.
 
-import os, re, sys, time, io, requests, csv, hashlib
+import os, re, sys, time, io, requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -10,7 +10,6 @@ import tensorflow as tf
 import joblib
 import gspread
 import argparse
-from datetime import datetime, timedelta, timezone
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.linear_model import LinearRegression
 
@@ -28,9 +27,16 @@ def parse_args():
     p.add_argument("--worksheet", required=True)
     p.add_argument("--symbol-column", default="Ticker")
     p.add_argument("--period", default=os.getenv("PERIOD", "1y"),
-                   help="How far back: 6mo, 1y, 3y, 5y")
+                   help="History window: e.g., 6mo, 1y, 3y, 5y")
     p.add_argument("--interval", default=os.getenv("INTERVAL", "1d"),
                    help="Bar size. Stooq supports 1d only; others fall back to yfinance.")
+    # NEW: training controls
+    p.add_argument("--epochs", type=int, default=int(os.getenv("EPOCHS", 40)),
+                   help="Max training epochs (with EarlyStopping)")
+    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", 256)),
+                   help="Batch size")
+    p.add_argument("--patience", type=int, default=int(os.getenv("PATIENCE", 5)),
+                   help="EarlyStopping patience (epochs) on val_loss")
     return p.parse_args()
 
 # ---------- Ticker utils ----------
@@ -68,8 +74,7 @@ def period_to_days(period_str: str) -> int:
     if ps.endswith("mo"):
         return int(ps[:-2]) * 30
     if ps in ("max", "all"):
-        return 10 * 365  # cap to 10y for training practicality
-    # default
+        return 10 * 365  # cap to 10y for practicality
     return 365
 
 def trim_period_daily(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -106,14 +111,15 @@ def fetch_stooq_one(ticker: str, session: requests.Session) -> pd.DataFrame:
     for i in range(3):
         try:
             r = session.get(url, timeout=20)
-            if r.status_code == 200 and r.text and "Date,Open,High,Low,Close,Volume" in r.text.splitlines()[0]:
-                df = pd.read_csv(io.StringIO(r.text))
-                # Normalize cols
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                df = df.dropna(subset=["Date"])
-                df = df.rename(columns={"Close": "close", "Volume": "vol"})
-                df["symbol"] = ticker
-                return df[["Date", "close", "vol", "symbol"]]
+            if r.status_code == 200 and r.text:
+                lines = r.text.splitlines()
+                if lines and "Date,Open,High,Low,Close,Volume" in lines[0]:
+                    df = pd.read_csv(io.StringIO(r.text))
+                    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                    df = df.dropna(subset=["Date"])
+                    df = df.rename(columns={"Close": "close", "Volume": "vol"})
+                    df["symbol"] = ticker
+                    return df[["Date", "close", "vol", "symbol"]]
         except Exception:
             pass
         time.sleep(1 + i)
@@ -205,20 +211,17 @@ def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
             yfd = yf_download(s, period=period, interval=interval, session=session)
             if not yfd.empty:
                 yfd = yfd.reset_index()  # ensure 'Date' column present
-                if "Date" not in yfd.columns:
-                    # sometimes index is named 'Datetime'
-                    if "Datetime" in yfd.columns:
-                        yfd = yfd.rename(columns={"Datetime": "Date"})
+                if "Date" not in yfd.columns and "Datetime" in yfd.columns:
+                    yfd = yfd.rename(columns={"Datetime": "Date"})
             if not yfd.empty:
-                # Normalize
-                need = {"Close", "Volume"}
-                if need.issubset(yfd.columns):
+                need = {"Date", "Close", "Volume"}
+                if need.issubset(set(yfd.columns)):
                     df2 = yfd[["Date", "Close", "Volume"]].rename(columns={"Close": "close", "Volume": "vol"})
                     df2["symbol"] = s
                     save_cache(df2, cpath)
                     frames.append(df2.rename(columns={"Date": "time"}))
                 else:
-                    print(f"Warning: yfinance missing expected columns for '{s}' ({list(yfd.columns)[:6]}...)")
+                    print(f"Warning: yfinance missing expected cols for '{s}' ({list(yfd.columns)[:6]}...)")
             else:
                 print(f"Warning: yfinance returned empty for '{s}'")
         else:
@@ -232,7 +235,7 @@ def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
     out = pd.concat(frames, ignore_index=True)
     return out  # columns: time, close, vol, symbol
 
-# ---------- Feature + model code (unchanged) ----------
+# ---------- Feature + model code ----------
 
 def make_features(df):
     df = df.copy()
@@ -279,12 +282,15 @@ def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
     model.compile(optimizer="adam", loss=tf.keras.losses.Huber(), metrics=["mae"])
     return model
 
+# ---------- Main ----------
+
 def main():
     args = parse_args()
     print(
         f"Received arguments: model='{args.model}', sheet-id='{args.sheet_id}', "
         f"worksheet='{args.worksheet}', symbol-column='{args.symbol_column}', "
-        f"period='{args.period}', interval='{args.interval}'"
+        f"period='{args.period}', interval='{args.interval}', "
+        f"epochs={args.epochs}, batch_size={args.batch_size}, patience={args.patience}"
     )
 
     # 1) Sheets auth
@@ -313,10 +319,10 @@ def main():
 
     # 3) Load prices → features
     raw = get_history(symbols, period=args.period, interval=args.interval)
-    # normalize column names for downstream
     raw = raw.rename(columns={"time": "time"}).sort_values(["symbol", "time"]).reset_index(drop=True)
     feat = make_features(raw)
 
+    # Linear branch
     if args.model == "linear":
         df = feat.dropna(subset=["ma10", "ma50"])
         if df.empty:
@@ -330,11 +336,30 @@ def main():
         print("✅ Saved models/linear_model.pkl")
         return
 
+    # CNN-LSTM branch
     X, y, scaler, feats = windowize(feat)
     print(f"Created training dataset with shape X: {X.shape}, y: {y.shape}")
-    model = build_model(n_features=X.shape[-1])
-    model.fit(X, y, epochs=8, batch_size=256, validation_split=0.1, verbose=2)
 
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=args.patience, restore_best_weights=True
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=max(1, args.patience // 2), min_lr=1e-5
+        ),
+    ]
+
+    model = build_model(n_features=X.shape[-1])
+    model.fit(
+        X, y,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        validation_split=0.1,
+        callbacks=callbacks,
+        verbose=2,
+    )
+
+    # 4) Save artifacts
     os.makedirs("models", exist_ok=True)
     model.save("models/cnn_lstm_ALL.keras")
     joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pkl")
