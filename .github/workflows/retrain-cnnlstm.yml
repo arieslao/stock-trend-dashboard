@@ -90,8 +90,10 @@ jobs:
             --model cnn-lstm \
             --sheet-id "$SHEET_ID" \
             --worksheet "$WORKSHEET_NAME" \
-            2>&1 | tee train_cnn_lstm.log
-
+            --symbol-column "Ticker" \
+            --period 3y \
+            --interval 1d \
+          
       - name: Upload training log
         if: always()
         uses: actions/upload-artifact@v4
