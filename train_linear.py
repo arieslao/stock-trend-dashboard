@@ -120,15 +120,16 @@ def fetch_data(ticker, lookback_days=1825, interval="1d"):
         interval=interval,
         auto_adjust=True,
         progress=False,
-        group_by="column",  # avoid MultiIndex columns
+        group_by="column",  # keep flat columns
     )
 
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
 
     df = df.rename_axis("Date").reset_index()
-    df["Ticker"] = ticker
+    df["Ticker"] = str(ticker)        # ← force present here
     return df
+
 
 
 def add_features(df):
@@ -154,44 +155,40 @@ def add_features(df):
 def build_dataset(tickers, lookback_days, interval, horizon=1):
     frames = []
     for t in tickers:
-        raw = fetch_data(t, lookback_days, interval)
+        raw  = fetch_data(t, lookback_days, interval)
         feat = add_features(raw)
+        feat["Ticker"] = str(t)        # ← force present again
         frames.append(feat)
 
     data = pd.concat(frames, ignore_index=True)
+    print("[INFO] columns:", list(data.columns))  # remove later
 
-    # Flatten columns robustly (avoids MultiIndex tuple issues)
+
+    # flatten columns (handles any MultiIndex)
     if isinstance(data.columns, pd.MultiIndex):
-        data.columns = [
-            "_".join([str(x) for x in col if x is not None])
-            for col in data.columns.values
-        ]
+        data.columns = ["_".join(str(x) for x in col if x is not None) for col in data.columns]
     else:
         data.columns = [str(c) for c in data.columns]
 
-    # Sanity checks (these two lines are what was erroring from a prior typo)
+    # sanity checks
     if "Ticker" not in data.columns:
         raise RuntimeError("Expected 'Ticker' column missing from data.")
     if "Close" not in data.columns:
         raise RuntimeError("Expected 'Close' column missing from data.")
 
-    # Re-create Target safely per ticker (guaranteed to exist)
+    # re-create Target per ticker (no leakage)
     data["Target"] = data.groupby("Ticker")["Close"].shift(-1)
 
-    # Features
-    feature_cols = [
-        c for c in data.columns
-        if c.startswith(("Lag", "SMA", "STD", "RSI", "Return1"))
-    ]
-
+    feature_cols = [c for c in data.columns if c.startswith(("Lag","SMA","STD","RSI","Return1"))]
     X = data[feature_cols].copy()
     y = data["Target"].copy()
 
     mask = X.notna().all(axis=1) & y.notna()
     X = X[mask].reset_index(drop=True)
     y = y[mask].reset_index(drop=True)
-    meta = data.loc[mask, ["Date", "Ticker", "Close"]].reset_index(drop=True)
+    meta = data.loc[mask, ["Date","Ticker","Close"]].reset_index(drop=True)
     return X, y, meta, feature_cols
+
 
 
 # ----------------------------
