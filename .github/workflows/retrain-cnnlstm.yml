@@ -72,6 +72,24 @@ jobs:
           print(f"Wrote a row to '{tab}'")
           PY
 
+      - name: Checkout data-cache branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-cache
+          path: _data_cache_branch
+        continue-on-error: true
+
+      - name: Restore cached CSVs
+        run: |
+          set -euxo pipefail
+          if [ -d "_data_cache_branch" ]; then
+            mkdir -p data_cache
+            rsync -a --delete "_data_cache_branch"/ data_cache/ || true
+            echo "Restored $(ls -1 data_cache | wc -l) cached file(s)"
+          else
+            echo "No data-cache branch found yet (first run?)"
+          fi
+
       - name: Prepare daily cache key
         run: echo "CACHE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
 
