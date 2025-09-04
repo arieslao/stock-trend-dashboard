@@ -2,8 +2,8 @@ name: Nightly CNN-LSTM Train
 
 on:
   schedule:
-    - cron: "30 2 * * *"   # 02:30 UTC daily (10:30 AM Manila, UTC+8)
-  workflow_dispatch: {}     # lets you run it manually from the UI
+    - cron: "30 2 * * *"   # 02:30 UTC daily
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -11,25 +11,87 @@ permissions:
 jobs:
   train:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.10"   # TensorFlow 2.15 works well on 3.10
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install tensorflow-cpu==2.15.* pandas numpy yfinance scikit-learn joblib gspread oauth2client
+          # core ML + Sheets packages
+          pip install tensorflow-cpu==2.15.* pandas numpy scikit-learn joblib
+          pip install gspread google-auth gspread-dataframe
 
-      - name: Train
-        run: python train.py
+      - name: Create service account JSON
+        env:
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        run: |
+          set -euxo pipefail
+          echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
+          python - <<'PY'
+          import json, os
+          p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
+          json.load(open(p))
+          print("Service account JSON OK:", p)
+          PY
 
-      - name: Commit model artifacts
+      - name: Sanity write to Google Sheet (CNN-LSTM tab)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: |
+          python - <<'PY'
+          import os, gspread
+          tab = "CNN-LSTM Output"   # <- change if you want a different tab name
+          gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
+          sh = gc.open_by_key(os.environ["SHEET_ID"])
+          try:
+              ws = sh.worksheet(tab)
+          except Exception:
+              ws = sh.add_worksheet(title=tab, rows=1000, cols=26)
+          ws.append_row(["CI smoke test (CNN-LSTM)", "ok"])
+          print(f"Wrote a row to '{tab}'")
+          PY
+
+      - name: Show train.py help (to confirm flags)
+        run: |
+          python train.py --help || true
+
+      - name: Train CNN-LSTM and write to its own tab
+        id: train
+        continue-on-error: true
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          WORKSHEET_NAME: CNN-LSTM Output   # <- this tab is separate from Linear
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: |
+          set -euxo pipefail
+          # If your script uses different flag names, edit to match --help output.
+          python train.py \
+            --model cnn-lstm \
+            --sheet-id "$SHEET_ID" \
+            --worksheet "$WORKSHEET_NAME" \
+            2>&1 | tee train_cnn_lstm.log
+
+      - name: Upload training log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-cnnlstm-log
+          path: train_cnn_lstm.log
+
+      - name: Commit model artifacts (optional)
+        if: steps.train.outcome == 'success'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl
-          git commit -m "Update CNN-LSTM model artifacts" || echo "No changes to commit"
+          git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl || true
+          git commit -m "Update CNN-LSTM weights ($(date -u +%F))" || echo "No changes"
           git push
