@@ -83,7 +83,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WORKSHEET_NAME: watchlist_cnnlstm
-          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+
         run: |
           set -euxo pipefail
           python train.py \
