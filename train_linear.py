@@ -111,15 +111,16 @@ def fetch_data(ticker, lookback_days=1825, interval="1d"):
     import yfinance as yf
     end = datetime.utcnow()
     start = end - timedelta(days=int(lookback_days))
-    df = yf.download(
-        ticker, 
-        start=start.strftime("%Y-%m-%d"), 
-        end=end.strftime("%Y-%m-%d"), 
-        interval=interval, 
-        auto_adjust=True, 
-        progress=False, 
-        group_by="column"
-    )
+df = yf.download(
+    ticker,
+    start=start.strftime("%Y-%m-%d"),
+    end=end.strftime("%Y-%m-%d"),
+    interval=interval,
+    auto_adjust=True,
+    progress=False,
+    group_by="column",   # <— keeps simple columns
+)
+
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
     df = df.rename_axis("Date").reset_index()
@@ -152,29 +153,42 @@ def build_dataset(tickers, lookback_days, interval, horizon=1):
         raw = fetch_data(t, lookback_days, interval)
         feat = add_features(raw)
         frames.append(feat)
+
     data = pd.concat(frames, ignore_index=True)
 
-    # --- NEW: ensure flat, string columns (handles any MultiIndex tuples) ---
-    data.columns = [
-        c if isinstance(c, str)
-        else "_".join([str(x) for x in c if x is not None])
-        
+    # Flatten columns robustly (avoids MultiIndex tuple issues)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = [
+            "_".join([str(x) for x in col if x is not None])
+            for col in data.columns.values
+        ]
+    else:
+        data.columns = [str(c) for c in data.columns]
+
+    # Sanity checks (these two lines are what was erroring from a prior typo)
+    if "Ticker" not in data.columns:
+        raise RuntimeError("Expected 'Ticker' column missing from data.")
+    if "Close" not in data.columns:
+        raise RuntimeError("Expected 'Close' column missing from data.")
+
+    # Re-create Target safely per ticker (guaranteed to exist)
+    data["Target"] = data.groupby("Ticker")["Close"].shift(-1)
+
+    # Features
+    feature_cols = [
+        c for c in data.columns
+        if c.startswith(("Lag", "SMA", "STD", "RSI", "Return1"))
     ]
-    # --- RE-CREATE Target safely within each ticker group ---
-    if "Target" not in data.columns:
-        if "Close" not in data.columns:
-        raise RunTimeError("Expected 'Close' column missing from data.")
-        data["Target"] = data.groupby("Ticker")["Close"].shift(-1)
-    
-    # Keep rows with complete features and target
-    feature_cols = [c for c in data.columns if c.startswith(("Lag","SMA","STD","RSI","Return1"))]
-    X = data[feature_cols]
-    y = data["Target"]
+
+    X = data[feature_cols].copy()
+    y = data["Target"].copy()
+
     mask = X.notna().all(axis=1) & y.notna()
     X = X[mask].reset_index(drop=True)
     y = y[mask].reset_index(drop=True)
-    meta = data.loc[mask, ["Date","Ticker","Close"]].reset_index(drop=True)
+    meta = data.loc[mask, ["Date", "Ticker", "Close"]].reset_index(drop=True)
     return X, y, meta, feature_cols
+
 
 # ----------------------------
 # Train / Evaluate
