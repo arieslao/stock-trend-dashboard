@@ -5,12 +5,14 @@ numpy==1.26.4
 scikit-learn==1.4.2
 plotly==5.22.0
 requests==2.32.3
-yfinance==0.2.44
 joblib==1.4.2
+yfinance==0.2.44
+
 
 # Google Sheets
 gspread==6.1.2
 google-auth==2.33.0
+gspread-dataframe
 
 #TensorFlow dependencies
 tensorflow-cpu==2.15.0
