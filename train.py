@@ -37,6 +37,10 @@ def parse_args():
                    help="Batch size")
     p.add_argument("--patience", type=int, default=int(os.getenv("PATIENCE", 5)),
                    help="EarlyStopping patience (epochs) on val_loss")
+    p.add_argument("--use-prices-tab", action="store_true",
+               help="Read historical data from the 'prices' worksheet instead of downloading")
+    p.add_argument("--prices-worksheet", default=os.getenv("PRICES_TAB", "prices"),
+               help="Name of the worksheet that stores normalized prices")
     return p.parse_args()
 
 # ---------- Ticker utils ----------
@@ -64,6 +68,38 @@ def to_stooq_symbol(t):
     if not t.endswith(".us"):
         t = f"{t}.us"
     return t
+
+
+# ---------- Loader ----------
+
+def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(prices_tab)
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        raise SystemExit(f"'{prices_tab}' is empty.")
+    header = [h.strip() for h in values[0]]
+    idx = {name: header.index(name) for name in ["Date","Symbol","Close","Volume"]}
+    rows = values[1:]
+    import pandas as pd
+    df = pd.DataFrame([[r[idx["Date"]], r[idx["Symbol"]], r[idx["Close"]], r[idx["Volume"]]] 
+                      for r in rows if len(r) >= len(header)],
+                      columns=["Date","Symbol","Close","Volume"])
+    symbols_up = {s.upper() for s in symbols}
+    df = df[df["Symbol"].str.upper().isin(symbols_up)].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    df = df.dropna(subset=["Date","Close"])
+    def _days(p): 
+        p = str(p).lower()
+        return int(p[:-1])*365 if p.endswith("y") else (int(p[:-2])*30 if p.endswith("mo") else 365)
+    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=_days(period))
+    df = df[df["Date"] >= cutoff]
+    df = df.rename(columns={"Date":"time","Close":"close","Volume":"vol","Symbol":"symbol"})
+    return df.sort_values(["symbol","time"]).reset_index(drop=True)
+
+
 
 # ---------- Period helpers (daily only) ----------
 
@@ -177,6 +213,53 @@ def save_cache(df: pd.DataFrame, path: str) -> None:
         df.to_csv(path, index=False)
     except Exception:
         pass
+
+# ---- Load from Google Sheet 'prices' tab ----
+def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
+    import pandas as pd
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(prices_tab)
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        raise SystemExit(f"'{prices_tab}' is empty.")
+
+    header = [h.strip() for h in values[0]]
+    required = ["Date", "Symbol", "Close", "Volume"]
+    for col in required:
+        if col not in header:
+            raise SystemExit(f"'{prices_tab}' is missing column '{col}'")
+    idx = {name: header.index(name) for name in required}
+
+    rows = values[1:]
+    df = pd.DataFrame(
+        [[r[idx["Date"]], r[idx["Symbol"]], r[idx["Close"]], r[idx["Volume"]]]
+         for r in rows if len(r) >= len(header)],
+        columns=["Date","Symbol","Close","Volume"]
+    )
+
+    # keep only requested symbols
+    symbols_up = {s.upper() for s in symbols}
+    df = df[df["Symbol"].str.upper().isin(symbols_up)].copy()
+
+    # types
+    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce")
+    df["Close"]  = pd.to_numeric(df["Close"], errors="coerce")
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+    df = df.dropna(subset=["Date","Close"])
+
+    # trim to requested period (daily)
+    def _days(p):
+        p = str(p).lower()
+        if p.endswith("y"):  return int(p[:-1]) * 365
+        if p.endswith("mo"): return int(p[:-2]) * 30
+        return 365
+    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=_days(period))
+    df = df[df["Date"] >= cutoff]
+
+    # final columns
+    df = df.rename(columns={"Date":"time","Close":"close","Volume":"vol","Symbol":"symbol"})
+    return df.sort_values(["symbol","time"]).reset_index(drop=True)
+
 
 # ---------- Unified history fetch ----------
 
@@ -317,8 +400,14 @@ def main():
         sys.exit(1)
     print(f"Using tickers: {symbols}")
 
-    # 3) Load prices → features
+    # 3) Load prices → features 
+    # Use data from the Google Sheet 'prices' tab if requested; otherwise download
+if args.use_prices_tab:
+    print(f"Loading data from prices tab '{args.prices_worksheet}'...")
+    raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, period=args.period)
+else:
     raw = get_history(symbols, period=args.period, interval=args.interval)
+
     raw = raw.rename(columns={"time": "time"}).sort_values(["symbol", "time"]).reset_index(drop=True)
     feat = make_features(raw)
 
