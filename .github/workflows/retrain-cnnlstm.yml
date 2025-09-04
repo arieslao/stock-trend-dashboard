@@ -54,14 +54,14 @@ jobs:
           print("Service account JSON OK at:", p)
           PY
 
-      - name: Sanity write to Google Sheet (CNN-LSTM tab)
+      - name: Sanity write to Google Sheet (CI Health tab)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: |
           python - <<'PY'
           import os, gspread
-          tab = "watchlist_cnnlstm"
+          tab = "CI Health"
           gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
           sh = gc.open_by_key(os.environ["SHEET_ID"])
           try:
@@ -82,7 +82,7 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          WORKSHEET_NAME: CNN-LSTM Output
+          WORKSHEET_NAME: watchlist_cnnlstm
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
         run: |
           set -euxo pipefail
