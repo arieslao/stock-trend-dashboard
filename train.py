@@ -99,4 +99,113 @@ def make_session():
 def fetch_stooq_one(ticker: str, session: requests.Session) -> pd.DataFrame:
     """
     Download daily CSV from Stooq for one ticker.
-    URL form: https://stooq.com/q/d/l/?
+    URL form: https://stooq.com/q/d/l/?s=aapl.us&i=d
+    """
+    sym = to_stooq_symbol(ticker)
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    for i in range(3):
+        try:
+            r = session.get(url, timeout=20)
+            if r.status_code == 200 and r.text and "Date,Open,High,Low,Close,Volume" in r.text.splitlines()[0]:
+                df = pd.read_csv(io.StringIO(r.text))
+                # Normalize cols
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+                df = df.dropna(subset=["Date"])
+                df = df.rename(columns={"Close": "close", "Volume": "vol"})
+                df["symbol"] = ticker
+                return df[["Date", "close", "vol", "symbol"]]
+        except Exception:
+            pass
+        time.sleep(1 + i)
+    return pd.DataFrame()
+
+# ---------- yfinance fallback (supports intraday too) ----------
+
+def yf_download(ticker, period, interval, session, tries=4, backoff=3) -> pd.DataFrame:
+    last = None
+    for i in range(1, tries + 1):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=30,
+                session=session,
+            )
+            if df is not None and not df.empty:
+                return df
+            last = "empty dataframe"
+        except Exception as e:
+            last = e
+        time.sleep(backoff * i)
+    # alt path
+    try:
+        df = yf.Ticker(ticker, session=session).history(period=period, interval=interval, auto_adjust=True)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e2:
+        last = e2
+    print(f"Warning: yfinance failed for '{ticker}': {last}")
+    return pd.DataFrame()
+
+# ---------- Cache helpers ----------
+
+def cache_path(ticker: str, source: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    safe = ticker.replace("/", "_")
+    return os.path.join(CACHE_DIR, f"{source}_{safe}.csv")
+
+def load_cache(path: str) -> pd.DataFrame:
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path, parse_dates=["Date"])
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def save_cache(df: pd.DataFrame, path: str) -> None:
+    try:
+        df.to_csv(path, index=False)
+    except Exception:
+        pass
+
+# ---------- Unified history fetch ----------
+
+def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
+    """
+    Primary: Stooq (daily only). Fallback: yfinance for anything else or if Stooq fails.
+    Uses a local CSV cache so transient network failures don't kill the run.
+    """
+    session = make_session()
+    frames = []
+
+    for s in symbols:
+        # Try Stooq only for daily interval
+        df = pd.DataFrame()
+        if interval == "1d":
+            cpath = cache_path(s, "stooq")
+            df = load_cache(cpath)
+            if df.empty:
+                df = fetch_stooq_one(s, session)
+                if not df.empty:
+                    save_cache(df, cpath)
+            if not df.empty:
+                df = trim_period_daily(df, period)
+                frames.append(df.rename(columns={"Date": "time"}))
+                time.sleep(0.5)
+                continue  # next ticker
+
+        # Fallback to Yahoo Finance for intraday or if Stooq failed
+        cpath = cache_path(s, "yfinance")
+        yfd = load_cache(cpath)
+        if yfd.empty:
+            yfd = yf_download(s, period=period, interval=interval, session=session)
+            if not yfd.empty:
+                yfd = yfd.reset_index()  # ensure 'Date' column present
+                if "Date" not in yfd.columns:
+                    # sometimes index is named 'Datetime'
+                    if "Datetime" in yfd.columns:
+                        yfd = yfd.rename(columns={"Date
