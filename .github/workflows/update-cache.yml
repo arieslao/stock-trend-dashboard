@@ -1,0 +1,84 @@
+name: Update Price Cache (daily)
+
+on:
+  schedule:
+    - cron: "0 2 * * *"          # 02:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update_cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Google Sheets service account file (you already use this)
+      - name: Create service account JSON (temp + gspread default)
+        env:
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        run: |
+          set -euxo pipefail
+          echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
+          mkdir -p "$HOME/.config/gspread"
+          echo "$GOOGLE_SHEETS_JSON" > "$HOME/.config/gspread/service_account.json"
+
+      # Restore yesterday's snapshot from the data-cache branch (if it exists)
+      - name: Checkout data-cache branch (if exists)
+        uses: actions/checkout@v4
+        with:
+          ref: data-cache
+          path: _data_cache_branch
+        continue-on-error: true
+
+      - name: Restore previous cache snapshot
+        run: |
+          set -euxo pipefail
+          if [ -d "_data_cache_branch" ]; then
+            mkdir -p data_cache
+            rsync -a --delete "_data_cache_branch"/ data_cache/ || true
+            echo "Restored $(ls -1 data_cache | wc -l) cached file(s)"
+          else
+            echo "No existing data-cache branch yet"
+          fi
+
+      # Update cache for ALL watchlists you care about (comma-separated)
+      - name: Update cache from Sheets watchlists
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          WATCHLISTS: "watchlist_cnnlstm,watchlist_linear"
+          SYMBOL_COL: "Ticker"
+          PERIOD: "5y"
+          INTERVAL: "1d"
+        run: |
+          set -euxo pipefail
+          python fetch_prices.py \
+            --sheet-id "$SHEET_ID" \
+            --worksheets "$WATCHLISTS" \
+            --symbol-column "$SYMBOL_COL" \
+            --period "$PERIOD" \
+            --interval "$INTERVAL"
+
+      # Publish ONLY the data_cache folder to the data-cache branch (single-file snapshot; no growing history)
+      - name: Publish cache snapshot
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: data-cache
+          publish_dir: data_cache
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
