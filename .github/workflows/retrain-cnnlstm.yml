@@ -91,7 +91,7 @@ jobs:
             --sheet-id "$SHEET_ID" \
             --worksheet "$WORKSHEET_NAME" \
             --symbol-column "Ticker" \
-            --period 3y \
+            --period 1y \
             --interval 1d \
           
       - name: Upload training log
