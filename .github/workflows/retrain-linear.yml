@@ -1,90 +1,33 @@
-name: Retrain Linear (daily)
+name: Retrain Linear
 
 on:
-  schedule:
-    - cron: "15 8 * * *"   # daily 08:15 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas numpy yfinance tensorflow-cpu scikit-learn joblib gspread google-auth google-auth-oauthlib
-          fi
+          pip install pandas numpy yfinance scikit-learn joblib gspread oauth2client
 
-      - name: Create service account JSON file
-        env:
-          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+      - name: Train
+        run: python train_linear.py
+
+      - name: Commit model artifacts
         run: |
-          set -euxo pipefail
-          echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
-          # Validate that the JSON parses (helps catch bad pasting/quoting)
-          python - <<'PY'
-          import json, os
-          p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
-          json.load(open(p))
-          print("Service account JSON OK:", p)
-          PY
-
-      - name: Quick environment debug
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: |
-          set -euxo pipefail
-          python -V
-          pip list | sed -n '1,80p'
-          echo "SHEET_ID length: ${#SHEET_ID:-0}"
-
-      - name: Sanity write to Google Sheet (proves auth + sharing)
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: |
-          python - <<'PY'
-          import os, gspread
-          gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-          sh = gc.open_by_key(os.environ["SHEET_ID"])
-          try:
-              ws = sh.worksheet("Test Watchlist")
-          except Exception:
-              ws = sh.add_worksheet(title="Test Watchlist", rows=1000, cols=26)
-          ws.append_row(["CI smoke test", "ok"])
-          print("Wrote a row to 'Test Watchlist'")
-          PY
-
-      - name: Show train.py help (to confirm flag names)
-        run: |
-          python train.py --help || true
-
-      - name: Train (Linear) and write results
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
-        run: |
-          set -euxo pipefail
-          # If your script uses different flag names, update these
-          python train.py \
-            --model linear \
-            --sheet-id "$SHEET_ID" \
-            --worksheet "Test Watchlist"
-
-      - name: Success message
-        run: echo "Retrain Linear finished successfully."
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/linear_ALL.pkl models/scaler_ALL.pkl
+          git commit -m "Update Linear model artifacts" || echo "No changes to commit"
+          git push
