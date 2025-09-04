@@ -94,12 +94,15 @@ def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
 
 def main():
     # 1. Set up argument parser to read arguments from the YAML file
-    parser = argparse.ArgumentParser(description="Train a CNN-LSTM model on stock data from Google Sheets.")
+    parser = argparse.ArgumentParser(description="Train stock prediction models on data from Google Sheets.")
+    parser.add_argument("--model", choices=["cnn-lstm", "linear"], default="cnn-lstm", help="Model type to train.")
     parser.add_argument("--sheet-id", required=True, help="ID of the Google Sheet containing stock symbols.")
     parser.add_argument("--worksheet", required=True, help="Name of the worksheet with the symbol list.")
     parser.add_argument("--symbol-column", default="Ticker", help="Name of the column containing the stock symbols.")
     args = parser.parse_args()
-    print(f"Received arguments: sheet-id='{args.sheet_id}', worksheet='{args.worksheet}', symbol-column='{args.symbol_column}'")
+    print(
+        f"Received arguments: model='{args.model}', sheet-id='{args.sheet_id}', worksheet='{args.worksheet}', symbol-column='{args.symbol_column}'"
+    )
 
     # 2. Authenticate with Google Sheets and fetch symbols
     # gspread automatically uses the GOOGLE_APPLICATION_CREDENTIALS env variable set in the workflow
@@ -127,13 +130,28 @@ def main():
     # 3. Run the ML pipeline using the fetched symbols
     raw = get_history(symbols, years=5)
     feat = make_features(raw)
+
+    if args.model == "linear":
+        df = feat.dropna(subset=["ma10", "ma50"])
+        if df.empty:
+            print("Error: Not enough data to train linear model.")
+            return
+        X = df[["ma10", "ma50"]].values
+        y = df["close"].values
+        model = LinearRegression()
+        model.fit(X, y)
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(model, "models/linear_model.pkl")
+        print("✅ Successfully saved models/linear_model.pkl")
+        return
+
     X, y, scaler, feats = windowize(feat)
-    
+
     print(f"Created training dataset with shape X: {X.shape}, y: {y.shape}")
-    
+
     model = build_model(n_features=X.shape[-1])
     model.fit(X, y, epochs=8, batch_size=256, validation_split=0.1, verbose=2)
-    
+
     # 4. Save the trained model and scaler
     os.makedirs("models", exist_ok=True)
     model.save("models/cnn_lstm_ALL.keras")

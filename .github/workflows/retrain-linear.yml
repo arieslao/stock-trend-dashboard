@@ -26,11 +26,8 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install google-auth gspread pandas numpy scikit-learn
+            pip install pandas numpy yfinance tensorflow-cpu scikit-learn joblib gspread google-auth google-auth-oauthlib
           fi
-          run: |
-            python -m pip install --upgrade pip
-            pip install pandas numpy yfinance tensorflow scikit-learn joblib gspread google-auth-oauthlib
 
       - name: Create service account JSON file
         env:
