@@ -61,7 +61,7 @@ jobs:
         run: |
           python - <<'PY'
           import os, gspread
-          tab = "CNN-LSTM Output"
+          tab = "watchlist_cnnlstm"
           gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
           sh = gc.open_by_key(os.environ["SHEET_ID"])
           try:
