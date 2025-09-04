@@ -120,15 +120,46 @@ def fetch_data(ticker, lookback_days=1825, interval="1d"):
         interval=interval,
         auto_adjust=True,
         progress=False,
-        group_by="column",  # keep flat columns
+        group_by="column",  # yfinance sometimes still returns MultiIndex
     )
 
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
 
+    # --- NEW: If MultiIndex or tuple-like columns, slice to this ticker and flatten ---
+    cols = df.columns
+    # Case 1: true MultiIndex
+    if hasattr(cols, "nlevels") and getattr(cols, "nlevels", 1) > 1:
+        # Try to take the column level that matches the ticker
+        if ticker in cols.get_level_values(-1):
+            df = df.xs(ticker, axis=1, level=-1)  # e.g., ('Close','AAPL') -> 'Close'
+        elif ticker in cols.get_level_values(0):
+            df = df.xs(ticker, axis=1, level=0)
+        else:
+            # Fallback: pick first ticker-like level if present
+            uniq = [u for u in cols.get_level_values(-1).unique() if isinstance(u, str)]
+            if uniq:
+                df = df.xs(uniq[0], axis=1, level=-1)
+        df.columns = [str(c) for c in df.columns]
+    else:
+        # Case 2: plain Index of tuples (pandas sometimes does this)
+        if any(isinstance(c, tuple) for c in cols):
+            # Keep only the columns for our ticker if present
+            sel = {}
+            for c in cols:
+                if isinstance(c, tuple):
+                    first, second = (c + ("",))[:2]
+                    if second == "" or second == ticker:
+                        sel["_".join([str(x) for x in (first,) if x])] = df[c]
+                else:
+                    sel[str(c)] = df[c]
+            df = pd.DataFrame(sel)
+
+    # Back to a normal, single-level frame
     df = df.rename_axis("Date").reset_index()
-    df["Ticker"] = str(ticker)        # ← force present here
+    df["Ticker"] = str(ticker)
     return df
+
 
 
 
