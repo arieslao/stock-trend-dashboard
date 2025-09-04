@@ -208,4 +208,137 @@ def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
                 if "Date" not in yfd.columns:
                     # sometimes index is named 'Datetime'
                     if "Datetime" in yfd.columns:
-                        yfd = yfd.rename(columns={"Date
+                        yfd = yfd.rename(columns={"Datetime": "Date"})
+            if not yfd.empty:
+                # Normalize
+                need = {"Close", "Volume"}
+                if need.issubset(yfd.columns):
+                    df2 = yfd[["Date", "Close", "Volume"]].rename(columns={"Close": "close", "Volume": "vol"})
+                    df2["symbol"] = s
+                    save_cache(df2, cpath)
+                    frames.append(df2.rename(columns={"Date": "time"}))
+                else:
+                    print(f"Warning: yfinance missing expected columns for '{s}' ({list(yfd.columns)[:6]}...)")
+            else:
+                print(f"Warning: yfinance returned empty for '{s}'")
+        else:
+            frames.append(yfd.rename(columns={"Date": "time"}))
+        time.sleep(0.5)
+
+    if not frames:
+        print("Error: No data could be fetched for any symbols. Exiting.")
+        sys.exit(1)
+
+    out = pd.concat(frames, ignore_index=True)
+    return out  # columns: time, close, vol, symbol
+
+# ---------- Feature + model code (unchanged) ----------
+
+def make_features(df):
+    df = df.copy()
+    df["ret1"] = df.groupby("symbol")["close"].pct_change()
+    df["ma10"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(10).mean())
+    df["ma50"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(50).mean())
+    df["vlog"] = np.log1p(df["vol"])
+    return df.dropna()
+
+def windowize(df, window=WINDOW, horizons=HORIZONS):
+    feats = ["close", "ret1", "ma10", "ma50", "vlog"]
+    scaler = MinMaxScaler()
+    df = df.copy()
+    df[feats] = scaler.fit_transform(df[feats].values)
+
+    Xs, Ys = [], []
+    for s, g in df.groupby("symbol"):
+        g = g.reset_index(drop=True)
+        if len(g) <= window + max(horizons):
+            print(f"Warning: Not enough data for symbol '{s}' to create windows. Skipping.")
+            continue
+        for i in range(len(g) - window - max(horizons)):
+            x = g.loc[i:i+window-1, feats].values
+            future = [g.loc[i+window-1+h, "close"] for h in horizons]
+            Xs.append(x)
+            Ys.append(future)
+
+    if not Xs:
+        print("Error: Could not create any training windows from the provided data. Exiting.")
+        sys.exit(1)
+
+    X = np.array(Xs)
+    y = np.array(Ys, dtype=np.float32)
+    return X, y, scaler, feats
+
+def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
+    inp = tf.keras.Input(shape=(window, n_features))
+    x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(inp)
+    x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(x)
+    x = tf.keras.layers.LSTM(64)(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    out = tf.keras.layers.Dense(n_out)(x)
+    model = tf.keras.Model(inp, out)
+    model.compile(optimizer="adam", loss=tf.keras.losses.Huber(), metrics=["mae"])
+    return model
+
+def main():
+    args = parse_args()
+    print(
+        f"Received arguments: model='{args.model}', sheet-id='{args.sheet_id}', "
+        f"worksheet='{args.worksheet}', symbol-column='{args.symbol_column}', "
+        f"period='{args.period}', interval='{args.interval}'"
+    )
+
+    # 1) Sheets auth
+    print("Authenticating with Google Sheets...")
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") \
+        or os.path.expanduser("~/.config/gspread/service_account.json")
+    gc = gspread.service_account(filename=creds_path)
+    sh = gc.open_by_key(args.sheet_id)
+    ws = sh.worksheet(args.worksheet)
+
+    # 2) Read tickers
+    header_row = ws.row_values(1)
+    lower = [h.strip().lower() for h in header_row]
+    try:
+        col_index = lower.index(args.symbol_column.strip().lower()) + 1
+    except ValueError:
+        print(f"Error: Column '{args.symbol_column}' not found in worksheet '{args.worksheet}'.")
+        sys.exit(1)
+
+    symbols = ws.col_values(col_index)[1:]
+    symbols = clean_tickers(symbols)
+    if not symbols:
+        print("Error: No valid tickers found. Exiting.")
+        sys.exit(1)
+    print(f"Using tickers: {symbols}")
+
+    # 3) Load prices → features
+    raw = get_history(symbols, period=args.period, interval=args.interval)
+    # normalize column names for downstream
+    raw = raw.rename(columns={"time": "time"}).sort_values(["symbol", "time"]).reset_index(drop=True)
+    feat = make_features(raw)
+
+    if args.model == "linear":
+        df = feat.dropna(subset=["ma10", "ma50"])
+        if df.empty:
+            print("Error: Not enough data to train linear model.")
+            sys.exit(1)
+        X = df[["ma10", "ma50"]].values
+        y = df["close"].values
+        model = LinearRegression().fit(X, y)
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(model, "models/linear_model.pkl")
+        print("✅ Saved models/linear_model.pkl")
+        return
+
+    X, y, scaler, feats = windowize(feat)
+    print(f"Created training dataset with shape X: {X.shape}, y: {y.shape}")
+    model = build_model(n_features=X.shape[-1])
+    model.fit(X, y, epochs=8, batch_size=256, validation_split=0.1, verbose=2)
+
+    os.makedirs("models", exist_ok=True)
+    model.save("models/cnn_lstm_ALL.keras")
+    joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pkl")
+    print("✅ Saved models/cnn_lstm_ALL.keras and models/scaler_ALL.pkl")
+
+if __name__ == "__main__":
+    main()
