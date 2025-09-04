@@ -1,4 +1,4 @@
-name: Nightly CNN-LSTM Train
+name: Nightly CNN-LSTM Train (BACKUP)
 on:
   schedule:
     - cron: "30 2 * * *"   # 02:30 UTC daily (10:30 AM Manila, UTC+8)
