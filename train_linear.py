@@ -111,7 +111,15 @@ def fetch_data(ticker, lookback_days=1825, interval="1d"):
     import yfinance as yf
     end = datetime.utcnow()
     start = end - timedelta(days=int(lookback_days))
-    df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False, group_by="column")
+    df = yf.download(
+        ticker, 
+        start=start.strftime("%Y-%m-%d"), 
+        end=end.strftime("%Y-%m-%d"), 
+        interval=interval, 
+        auto_adjust=True, 
+        progress=False, 
+        group_by="column"
+    )
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
     df = df.rename_axis("Date").reset_index()
@@ -150,19 +158,23 @@ def build_dataset(tickers, lookback_days, interval, horizon=1):
     data.columns = [
         c if isinstance(c, str)
         else "_".join([str(x) for x in c if x is not None])
-        for c in data.columns
+        
     ]
-
+    # --- RE-CREATE Target safely within each ticker group ---
+    if "Target" not in data.columns:
+        if "Close" not in data.columns;
+        raise RunTimeError("Expected 'Close' column missing from data.")
+        data["Target"] = data.groupby("Ticker")["Close"].shift(-1)
     
     # Keep rows with complete features and target
     feature_cols = [c for c in data.columns if c.startswith(("Lag","SMA","STD","RSI","Return1"))]
     X = data[feature_cols]
     y = data["Target"]
     mask = X.notna().all(axis=1) & y.notna()
-    X = X[mask]
-    y = y[mask]
+    X = X[mask].reset_index(drop=True)
+    y = y[mask].reset_index(drop=True)
     meta = data.loc[mask, ["Date","Ticker","Close"]].reset_index(drop=True)
-    return X.reset_index(drop=True), y.reset_index(drop=True), meta.reset_index(drop=True), feature_cols
+    return X, y, meta, feature_cols
 
 # ----------------------------
 # Train / Evaluate
@@ -191,6 +203,11 @@ def train_and_eval(X, y):
     print(f"[Linear] MAE={mae:.4f} RMSE={rmse:.4f} R2={r2:.4f} Alpha*={getattr(model, 'alpha_', 'N/A')}")
 
     return model, scaler, preds, y_test
+
+# --- Quick Debug Print ---
+print("[DEBUG] columns:", list(data.columns)[:20])
+print("[DEBUG] has Target?", "Target" in data.columns)
+
 
 # ----------------------------
 # Main
