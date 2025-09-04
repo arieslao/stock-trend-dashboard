@@ -102,7 +102,7 @@ jobs:
             --sheet-id "$SHEET_ID" \
             --worksheet "$WORKSHEET_NAME" \
             --symbol-column "Ticker" \
-            --period 1y \
+            --period 5y \
             --interval 1d \
             2>&1 | tee "$LOG"
 
