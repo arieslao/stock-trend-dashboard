@@ -1,9 +1,11 @@
 # train.py — nightly trainer for CNN-LSTM (multi-horizon)
-# This script integrates with the Google Sheets workflow.
+# Integrates with Google Sheets. Hardened yfinance fetch with retries/fallback.
 
 import os
 import re
 import sys
+import time
+import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -21,13 +23,7 @@ HORIZONS = [1, 3, 5, 10, 20]
 # ---------- Helpers ----------
 
 def clean_tickers(raw):
-    """
-    Normalize and filter tickers:
-    - uppercases
-    - removes blanks
-    - allows common ticker chars only (no spaces)
-    - de-duplicates in original order
-    """
+    """Keep only plausible ticker symbols (no spaces), dedupe in order."""
     out = []
     for t in raw:
         if not t:
@@ -36,45 +32,74 @@ def clean_tickers(raw):
         # allow A-Z, digits, ^, ., -, =
         if re.fullmatch(r"[\^A-Z0-9.\-=]{1,15}", t):
             out.append(t)
-    # dedupe preserving order
     return list(dict.fromkeys(out))
 
-def get_history(symbols=("AAPL",), period="1y", interval="1d"):
-    """
-    Fetch historical OHLCV via yfinance.
-    period examples: '6mo', '1y', '5y'
-    interval examples: '1d', '1h', '30m'
-    """
-    print(f"Fetching {period} of {interval} data for symbols: {', '.join(symbols)}")
-    frames = []
-    for s in symbols:
+def make_session():
+    """Session with friendly headers to avoid some 403/HTML responses."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    })
+    return s
+
+def _download_yf(ticker, period, interval, session, tries=4, backoff=3):
+    """Download one ticker with retries + fallback to Ticker.history."""
+    last_err = None
+    for i in range(1, tries + 1):
         try:
-            # Simple download path (auto_adjust=True is common for modeling)
             df = yf.download(
-                s,
+                ticker,
                 period=period,
                 interval=interval,
                 auto_adjust=True,
                 progress=False,
                 threads=False,
                 timeout=30,
+                session=session,
             )
-            if df is None or df.empty:
-                print(f"Warning: No data found for symbol '{s}'. Skipping.")
-                continue
-            # Ensure the expected columns are present
-            cols = [c for c in df.columns]
-            # yfinance returns e.g. ['Open','High','Low','Close','Adj Close','Volume']
-            need = {"Close", "Volume"}
-            if not need.issubset(set(cols)):
-                print(f"Warning: Missing expected columns for '{s}' (have {cols}). Skipping.")
-                continue
-            h = df[["Close", "Volume"]].rename(columns={"Close": "close", "Volume": "vol"})
-            h["symbol"] = s
-            frames.append(h)
+            if df is not None and not df.empty:
+                return df
+            last_err = "empty dataframe"
         except Exception as e:
-            print(f"Warning: Could not fetch data for '{s}'. Error: {e}. Skipping.")
+            last_err = e
+        time.sleep(backoff * i)
+
+    # Fallback path
+    try:
+        df = yf.Ticker(ticker, session=session).history(
+            period=period, interval=interval, auto_adjust=True
+        )
+        if df is not None and not df.empty:
+            return df
+    except Exception as e2:
+        last_err = e2
+
+    print(f"Warning: yfinance failed for '{ticker}': {last_err}")
+    return pd.DataFrame()
+
+def get_history(symbols=("AAPL",), period="1y", interval="1d"):
+    """Fetch historical OHLCV via yfinance with retries/fallback."""
+    print(f"Fetching {period} of {interval} data for symbols: {', '.join(symbols)}")
+    frames, session = [], make_session()
+    for s in symbols:
+        df = _download_yf(s, period=period, interval=interval, session=session)
+        if df.empty:
+            print(f"Warning: No data found for symbol '{s}'. Skipping.")
             continue
+        need = {"Close", "Volume"}
+        if not need.issubset(df.columns):
+            print(f"Warning: Missing expected columns for '{s}' (have {list(df.columns)}). Skipping.")
+            continue
+        h = df[["Close", "Volume"]].rename(columns={"Close": "close", "Volume": "vol"})
+        h["symbol"] = s
+        frames.append(h)
+        time.sleep(1)  # be nice to Yahoo
 
     if not frames:
         print("Error: No data could be fetched for any symbols. Exiting.")
@@ -85,7 +110,7 @@ def get_history(symbols=("AAPL",), period="1y", interval="1d"):
     return out.reset_index()
 
 def make_features(df):
-    """Engineers features from the raw stock data."""
+    """Engineer features from the raw stock data."""
     df = df.copy()
     df["ret1"] = df.groupby("symbol")["close"].pct_change()
     df["ma10"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(10).mean())
@@ -94,7 +119,7 @@ def make_features(df):
     return df.dropna()
 
 def windowize(df, window=WINDOW, horizons=HORIZONS):
-    """Creates windowed sequences for training the time-series model."""
+    """Create windowed sequences for training the time-series model."""
     feats = ["close", "ret1", "ma10", "ma50", "vlog"]
     scaler = MinMaxScaler()
     df = df.copy()
@@ -121,7 +146,7 @@ def windowize(df, window=WINDOW, horizons=HORIZONS):
     return X, y, scaler, feats
 
 def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
-    """Builds and compiles the CNN-LSTM Keras model."""
+    """Build and compile the CNN-LSTM Keras model."""
     inp = tf.keras.Input(shape=(window, n_features))
     x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(inp)
     x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(x)
@@ -135,31 +160,24 @@ def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
 # ---------- Main ----------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train stock prediction models using symbols from a Google Sheet."
-    )
-    parser.add_argument("--model", choices=["cnn-lstm", "linear"], default="cnn-lstm",
-                        help="Model type to train.")
-    parser.add_argument("--sheet-id", required=True,
-                        help="ID of the Google Sheet.")
-    parser.add_argument("--worksheet", required=True,
-                        help="Name of the worksheet with the symbol list.")
-    parser.add_argument("--symbol-column", default="Ticker",
-                        help="Header name of the column containing stock symbols.")
-    # NEW: timeframe controls
+    parser = argparse.ArgumentParser(description="Train models using symbols from a Google Sheet.")
+    parser.add_argument("--model", choices=["cnn-lstm", "linear"], default="cnn-lstm")
+    parser.add_argument("--sheet-id", required=True)
+    parser.add_argument("--worksheet", required=True)
+    parser.add_argument("--symbol-column", default="Ticker")
     parser.add_argument("--period", default=os.getenv("PERIOD", "1y"),
-                        help="How far back to fetch (e.g., 6mo, 1y, 5y).")
+                        help="How far back to fetch (e.g., 6mo, 1y, 3y, 5y)")
     parser.add_argument("--interval", default=os.getenv("INTERVAL", "1d"),
-                        help="Bar size (e.g., 1d, 1h, 30m, 5m).")
-
+                        help="Bar size (e.g., 1d, 1h, 30m, 5m)")
     args = parser.parse_args()
+
     print(
         f"Received arguments: model='{args.model}', sheet-id='{args.sheet_id}', "
         f"worksheet='{args.worksheet}', symbol-column='{args.symbol_column}', "
         f"period='{args.period}', interval='{args.interval}'"
     )
 
-    # 1) Authenticate with Google Sheets
+    # 1) Sheets auth
     print("Authenticating with Google Sheets...")
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") \
         or os.path.expanduser("~/.config/gspread/service_account.json")
@@ -167,7 +185,7 @@ def main():
     sh = gc.open_by_key(args.sheet_id)
     ws = sh.worksheet(args.worksheet)
 
-    # 2) Read symbols (case-insensitive header match)
+    # 2) Read symbols (case-insensitive header)
     header_row = ws.row_values(1)
     lower = [h.strip().lower() for h in header_row]
     try:
@@ -177,8 +195,8 @@ def main():
         sys.exit(1)
 
     symbols = ws.col_values(col_index)[1:]  # skip header
-    symbols = [s for s in symbols if s]     # drop empties
-    symbols = clean_tickers(symbols)        # drop notes/invalid entries
+    symbols = [s for s in symbols if s]
+    symbols = clean_tickers(symbols)
     if not symbols:
         print("Error: No valid tickers found in the specified column. Exiting.")
         sys.exit(1)
@@ -188,7 +206,7 @@ def main():
     raw = get_history(symbols, period=args.period, interval=args.interval)
     feat = make_features(raw)
 
-    # Linear model branch
+    # Linear branch
     if args.model == "linear":
         df = feat.dropna(subset=["ma10", "ma50"])
         if df.empty:
@@ -200,13 +218,12 @@ def main():
         model.fit(X, y)
         os.makedirs("models", exist_ok=True)
         joblib.dump(model, "models/linear_model.pkl")
-        print("✅ Successfully saved models/linear_model.pkl")
+        print("✅ Saved models/linear_model.pkl")
         return
 
     # CNN-LSTM branch
     X, y, scaler, feats = windowize(feat)
     print(f"Created training dataset with shape X: {X.shape}, y: {y.shape}")
-
     model = build_model(n_features=X.shape[-1])
     model.fit(X, y, epochs=8, batch_size=256, validation_split=0.1, verbose=2)
 
@@ -214,7 +231,7 @@ def main():
     os.makedirs("models", exist_ok=True)
     model.save("models/cnn_lstm_ALL.keras")
     joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pkl")
-    print("✅ Successfully saved models/cnn_lstm_ALL.keras and models/scaler_ALL.pkl")
+    print("✅ Saved models/cnn_lstm_ALL.keras and models/scaler_ALL.pkl")
 
 if __name__ == "__main__":
     main()
