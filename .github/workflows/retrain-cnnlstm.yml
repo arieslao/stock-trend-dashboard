@@ -71,6 +71,14 @@ jobs:
           ws.append_row(["CI smoke test (CNN-LSTM)", "ok"])
           print(f"Wrote a row to '{tab}'")
           PY
+      - name: Prepare daily cache key
+      run: echo "CACHE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+      - name: Cache price data
+      uses: actions/cache@v4
+      with:
+        path: data_cache
+        key: stooq-yf-${{ env.CACHE_DATE }}
+
 
       - name: Show train.py help (to confirm flags)
         run: |
