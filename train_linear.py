@@ -111,7 +111,7 @@ def fetch_data(ticker, lookback_days=1825, interval="1d"):
     import yfinance as yf
     end = datetime.utcnow()
     start = end - timedelta(days=int(lookback_days))
-    df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False)
+    df = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval, auto_adjust=True, progress=False, group_by="column")
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
     df = df.rename_axis("Date").reset_index()
@@ -145,6 +145,15 @@ def build_dataset(tickers, lookback_days, interval, horizon=1):
         feat = add_features(raw)
         frames.append(feat)
     data = pd.concat(frames, ignore_index=True)
+
+    # --- NEW: ensure flat, string columns (handles any MultiIndex tuples) ---
+    data.columns = [
+        c if isinstance(c, str)
+        else "_".join([str(x) for x in c if x is not None])
+        for c in data.columns
+    ]
+
+    
     # Keep rows with complete features and target
     feature_cols = [c for c in data.columns if c.startswith(("Lag","SMA","STD","RSI","Return1"))]
     X = data[feature_cols]
