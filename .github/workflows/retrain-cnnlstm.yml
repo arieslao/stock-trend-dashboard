@@ -71,14 +71,17 @@ jobs:
           ws.append_row(["CI smoke test (CNN-LSTM)", "ok"])
           print(f"Wrote a row to '{tab}'")
           PY
-      - name: Prepare daily cache key
-      run: echo "CACHE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
-      - name: Cache price data
-      uses: actions/cache@v4
-      with:
-        path: data_cache
-        key: stooq-yf-${{ env.CACHE_DATE }}
 
+      - name: Prepare daily cache key
+        run: echo "CACHE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
+
+      - name: Cache price data
+        uses: actions/cache@v4
+        with:
+          path: data_cache
+          key: stooq-yf-${{ env.CACHE_DATE }}
+          restore-keys: |
+            stooq-yf-
 
       - name: Show train.py help (to confirm flags)
         run: |
@@ -91,9 +94,9 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WORKSHEET_NAME: watchlist_cnnlstm
-
         run: |
           set -euxo pipefail
+          LOG="$GITHUB_WORKSPACE/train_cnn_lstm.log"
           python train.py \
             --model cnn-lstm \
             --sheet-id "$SHEET_ID" \
@@ -101,13 +104,14 @@ jobs:
             --symbol-column "Ticker" \
             --period 1y \
             --interval 1d \
-          
+            2>&1 | tee "$LOG"
+
       - name: Upload training log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: train-cnnlstm-log
-          path: train_cnn_lstm.log
+          path: ${{ github.workspace }}/train_cnn_lstm.log
 
       - name: Commit model artifacts (optional)
         if: steps.train.outcome == 'success'
