@@ -162,7 +162,7 @@ def build_dataset(tickers, lookback_days, interval, horizon=1):
     ]
     # --- RE-CREATE Target safely within each ticker group ---
     if "Target" not in data.columns:
-        if "Close" not in data.columns;
+        if "Close" not in data.columns:
         raise RunTimeError("Expected 'Close' column missing from data.")
         data["Target"] = data.groupby("Ticker")["Close"].shift(-1)
     
