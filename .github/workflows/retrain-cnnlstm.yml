@@ -120,9 +120,12 @@ jobs:
             --sheet-id "$SHEET_ID" \
             --worksheet "$WORKSHEET_NAME" \
             --symbol-column "Ticker" \
+            --use-prices-tab \
+            --prices-worksheet prices \
             --period 10y \
             --interval 1d \
             2>&1 | tee "$LOG"
+
 
       - name: Upload training log
         if: always()
