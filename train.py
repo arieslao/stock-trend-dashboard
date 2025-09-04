@@ -316,6 +316,8 @@ def main():
     # Save artifacts
     os.makedirs("models", exist_ok=True)
     model.save("models/cnn_lstm_ALL.keras")
-    joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pk_
+    joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pkl")
+    print("✅ Saved models/cnn_lstm_ALL.keras and models/scaler_ALL.pkl")
 
-
+if __name__ == "__main__":
+    main()
