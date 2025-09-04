@@ -109,23 +109,27 @@ def write_predictions_to_sheet(df):
 # ----------------------------
 def fetch_data(ticker, lookback_days=1825, interval="1d"):
     import yfinance as yf
+
     end = datetime.utcnow()
     start = end - timedelta(days=int(lookback_days))
-df = yf.download(
-    ticker,
-    start=start.strftime("%Y-%m-%d"),
-    end=end.strftime("%Y-%m-%d"),
-    interval=interval,
-    auto_adjust=True,
-    progress=False,
-    group_by="column",   # <— keeps simple columns
-)
+
+    df = yf.download(
+        ticker,
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",  # avoid MultiIndex columns
+    )
 
     if df.empty:
         raise RuntimeError(f"No data returned for {ticker}.")
+
     df = df.rename_axis("Date").reset_index()
     df["Ticker"] = ticker
     return df
+
 
 def add_features(df):
     # Basic technicals on Close
