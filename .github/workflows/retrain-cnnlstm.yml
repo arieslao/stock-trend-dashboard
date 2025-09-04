@@ -25,11 +25,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # core ML + Sheets packages
-          pip install tensorflow-cpu==2.15.* pandas numpy scikit-learn joblib
-          pip install gspread google-auth gspread-dataframe
 
-      - name: Create service account JSON
+      - name: Create service account JSON (temp)
         env:
           GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
         run: |
@@ -42,6 +39,21 @@ jobs:
           print("Service account JSON OK:", p)
           PY
 
+      - name: Put service account at gspread default path
+        env:
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.config/gspread"
+          echo "$GOOGLE_SHEETS_JSON" > "$HOME/.config/gspread/service_account.json"
+          ls -al "$HOME/.config/gspread"
+          python - <<'PY'
+          import json, os
+          p = os.path.expanduser("~/.config/gspread/service_account.json")
+          json.load(open(p))
+          print("Service account JSON OK at:", p)
+          PY
+
       - name: Sanity write to Google Sheet (CNN-LSTM tab)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
@@ -49,7 +61,7 @@ jobs:
         run: |
           python - <<'PY'
           import os, gspread
-          tab = "CNN-LSTM Output"   # <- change if you want a different tab name
+          tab = "CNN-LSTM Output"
           gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
           sh = gc.open_by_key(os.environ["SHEET_ID"])
           try:
@@ -70,11 +82,10 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          WORKSHEET_NAME: CNN-LSTM Output   # <- this tab is separate from Linear
+          WORKSHEET_NAME: CNN-LSTM Output
           FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
         run: |
           set -euxo pipefail
-          # If your script uses different flag names, edit to match --help output.
           python train.py \
             --model cnn-lstm \
             --sheet-id "$SHEET_ID" \
