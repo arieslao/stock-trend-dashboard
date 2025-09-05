@@ -30,6 +30,43 @@ def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
     idx = {c: header.index(c) for c in need}
     rows = values[1:]
 
+    # --- Normalize headers and types from Google Sheets 'prices' tab ---
+    # Expect headers like: Date, Symbol, Close, Volume  (but be forgiving)
+    df.columns = [c.strip().lower() for c in df.columns]
+    
+    # Map common variants to what the model code uses
+    # model expects: columns 'date', 'symbol', 'close', 'vol'
+    rename_map = {}
+    if 'adj close' in df.columns and 'close' not in df.columns:
+        rename_map['adj close'] = 'close'
+    if 'volume' in df.columns and 'vol' not in df.columns:
+        rename_map['volume'] = 'vol'
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    
+    required = {'date', 'symbol', 'close'}
+    missing = required - set(df.columns)
+    if missing:
+        raise RuntimeError(f"'prices' worksheet missing required columns: {missing}. "
+                           f"Found: {df.columns.tolist()}")
+    
+    # Parse types
+    df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce').dt.tz_localize(None)
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    if 'vol' in df.columns:
+        df['vol'] = pd.to_numeric(df['vol'], errors='coerce')
+    
+    # Drop unusable rows and sort
+    df = df.dropna(subset=['date', 'close'])
+    df = df.sort_values(['symbol', 'date'])
+    
+    # If you limit by period (e.g., 3y), do it after normalization
+    if period.endswith('y'):
+        n = int(period[:-1])
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.DateOffset(years=n)
+        df = df[df['date'] >= cutoff]
+
+
     df = pd.DataFrame(
         [[r[idx["Date"]], r[idx["Symbol"]], r[idx["Close"]], r[idx["Volume"]]]
          for r in rows if len(r) >= len(header)],
