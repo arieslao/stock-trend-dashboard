@@ -15,76 +15,79 @@ def period_to_days(p):
     if p.endswith("d"):  return int(p[:-1])
     return 365
 
-def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
+
+def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
+                           symbols: list[str] | None, period: str) -> pd.DataFrame:
+    """
+    Load prices from Google Sheet, normalize headers, filter by symbols/period,
+    and return a tidy DataFrame with columns: date, symbol, close [, vol].
+    """
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(prices_tab)
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        raise SystemExit(f"'{prices_tab}' is empty.")
+    ws = sh.worksheet(prices_worksheet)
 
-    header = [h.strip() for h in values[0]]
-    need = ["Date", "Symbol", "Close", "Volume"]
-    for c in need:
-        if c not in header:
-            raise SystemExit(f"'{prices_tab}' missing column '{c}'")
-    idx = {c: header.index(c) for c in need}
-    rows = values[1:]
+    vals = ws.get_all_values()
+    if not vals or len(vals) < 2:
+        raise RuntimeError(f"'{prices_worksheet}' is empty or missing headers")
 
-    # --- Normalize headers and types from Google Sheets 'prices' tab ---
-    # Expect headers like: Date, Symbol, Close, Volume  (but be forgiving)
+    # 1) Build df FIRST, then normalize headers
+    df = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
     df.columns = [c.strip().lower() for c in df.columns]
-    
-    # Map common variants to what the model code uses
-    # model expects: columns 'date', 'symbol', 'close', 'vol'
+
+    # 2) Map common header variants -> expected names
     rename_map = {}
-    if 'adj close' in df.columns and 'close' not in df.columns:
-        rename_map['adj close'] = 'close'
-    if 'volume' in df.columns and 'vol' not in df.columns:
-        rename_map['volume'] = 'vol'
+    if "adj close" in df.columns and "close" not in df.columns:
+        rename_map["adj close"] = "close"
+    if "volume" in df.columns and "vol" not in df.columns:
+        rename_map["volume"] = "vol"
     if rename_map:
         df = df.rename(columns=rename_map)
-    
-    required = {'date', 'symbol', 'close'}
+
+    # 3) Validate required cols
+    required = {"date", "symbol", "close"}
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(f"'prices' worksheet missing required columns: {missing}. "
-                           f"Found: {df.columns.tolist()}")
-    
-    # Parse types
-    df['date'] = pd.to_datetime(df['date'], utc=True, errors='coerce').dt.tz_localize(None)
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    if 'vol' in df.columns:
-        df['vol'] = pd.to_numeric(df['vol'], errors='coerce')
-    
-    # Drop unusable rows and sort
-    df = df.dropna(subset=['date', 'close'])
-    df = df.sort_values(['symbol', 'date'])
-    
-    # If you limit by period (e.g., 3y), do it after normalization
-    if period.endswith('y'):
-        n = int(period[:-1])
-        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.DateOffset(years=n)
-        df = df[df['date'] >= cutoff]
+        raise RuntimeError(
+            f"'{prices_worksheet}' missing required columns: {missing}. "
+            f"Found: {list(df.columns)}"
+        )
 
+    # 4) Parse types & clean
+    df["date"]   = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_localize(None)
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["close"]  = pd.to_numeric(df["close"], errors="coerce")
+    if "vol" in df.columns:
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
 
-    df = pd.DataFrame(
-        [[r[idx["Date"]], r[idx["Symbol"]], r[idx["Close"]], r[idx["Volume"]]]
-         for r in rows if len(r) >= len(header)],
-        columns=["Date", "Symbol", "Close", "Volume"]
-    )
-    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_localize(None)
-    df["Close"]  = pd.to_numeric(df["Close"], errors="coerce")
-    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-    df = df.dropna(subset=["Date","Close"])
-    df["Symbol"] = df["Symbol"].astype(str).str.upper()
+    df = df.dropna(subset=["date", "close"])
 
+    # 5) Optional: filter to requested symbols
     if symbols:
-        keep = {s.upper() for s in symbols}
-        df = df[df["Symbol"].isin(keep)]
-    cutoff = (pd.Timestamp.utcnow().tz_localize(None).normalize()
-              - pd.Timedelta(days=period_to_days(period)))
-    df = df[df["Date"] >= cutoff]
-    return df.sort_values(["Symbol","Date"]).reset_index(drop=True)
+        # tolerate casing/whitespace in input symbols
+        want = {s.strip().upper() for s in symbols if s and str(s).strip()}
+        df = df[df["symbol"].isin(want)]
+
+    # 6) Optional: filter by period: e.g., "3y", "18m", "max"
+    period = (period or "").strip().lower()
+    if period and period != "max":
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        cutoff = None
+        if period.endswith("y"):
+            n = int(period[:-1] or "1")
+            cutoff = now - pd.DateOffset(years=n)
+        elif period.endswith("m"):
+            n = int(period[:-1] or "1")
+            cutoff = now - pd.DateOffset(months=n)
+        elif period.endswith("d"):
+            n = int(period[:-1] or "1")
+            cutoff = now - pd.Timedelta(days=n)
+        if cutoff is not None:
+            df = df[df["date"] >= cutoff]
+
+    # 7) Sort & keep canonical columns order
+    cols = ["date", "symbol", "close"] + (["vol"] if "vol" in df.columns else [])
+    df = df[cols].sort_values(["symbol", "date"]).reset_index(drop=True)
+    return df
+
 
 def make_features(df):
     df = df.copy()
