@@ -1,39 +1,25 @@
-# ---------- Imports ----------
-import os, json, requests
-from datetime import datetime, timedelta, time as dtime
-from zoneinfo import ZoneInfo
-from pathlib import Path
-from typing import List, Dict, Optional
+# app.py — Stock Trend Dashboard (Sheets-first, with predictions writer)
+# - Primary data source: Google Sheets 'prices' (case-insensitive headers)
+# - CNN-LSTM multi-horizon predictions using the same scaler + feature list as training
+# - Linear MA10/MA50 fallback for the UI table (optional)
+# - Button to append per-horizon predictions to 'predictions' sheet
 
-# Optional / safe TF import (only used if you pick the CNN-LSTM model)
-try:
-    import tensorflow as tf  # noqa: F401
-except Exception:
-    tf = None  # graceful fallback to Linear if TF isn’t available
+import os, json
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.linear_model import LinearRegression  # kept for type hints / compatibility
-
 import streamlit as st
 
-# ---------- Constants ----------
-FEATURE_COLS = ["open", "high", "low", "close", "volume"]
-CLOSE_IDX = FEATURE_COLS.index("close")
-DEFAULT_LOOKBACK = 60  # sequence length for CNN-LSTM
+# Optional / safe TF import (only used if CNN-LSTM is present)
+try:
+    import tensorflow as tf  # noqa: F401
+except Exception:
+    tf = None  # allow UI to run without TF
 
-# Yahoo Finance request bits (centralized)
-YH_URL_BASE = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-YH_HEADERS_DEFAULT = {"User-Agent": "Mozilla/5.0"}
-
-LOG_COLUMNS = [
-    "ts_utc", "ts_pt", "symbol", "model", "lookback",
-    "days_history", "last_close", "predicted", "pct_change",
-    "in_window", "ma10", "ma50", "note"
-]
-
-# ---------- Google Sheets (optional) ----------
+# ---------- Google Sheets (service account) ----------
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -41,18 +27,37 @@ except Exception:
     gspread = None
     Credentials = None
 
+# ---------- Constants ----------
+DEFAULT_LOOKBACK = 60          # must match training WINDOW
+HORIZONS_DEFAULT = [1, 3, 5, 10, 20]
+PRICES_TAB = "prices"
+WATCHLIST_TAB = "watchlist_cnnlstm"
+WATCHLIST_COL = "Ticker"
+PREDICTIONS_TAB = "predictions"
 
+LOG_COLUMNS = [
+    "ts_utc", "symbol", "model", "lookback",
+    "days_history", "last_close", "predicted", "pct_change",
+    "note"
+]
+
+# ---------- Streamlit page ----------
+st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
+st.title("📈 AI-Powered Stock Trend Dashboard (Google Sheets)")
+st.caption(
+    "Education only — not financial advice. "
+    "Source of truth: Google Sheets → 'prices'. "
+    "Models: CNN-LSTM (multi-horizon) with Linear MA10/MA50 fallback for the table."
+)
+
+# ---------- Google Sheets helpers ----------
 @st.cache_resource(show_spinner=False)
-def _get_gsheet():
-    """Return (worksheet, account_email) or (None, message). Supports two secrets styles:
-       1) GOOGLE_SHEETS_JSON  (recommended: full Google JSON as-is)
-       2) [gcp_service_account]  (TOML table with the same fields)
-       Sheet id may be in GOOGLE_SHEETS_SHEET_ID or [gsheets].sheet_id.
-    """
+def _open_sheet() -> Tuple[Optional[object], Optional[object], Optional[str]]:
+    """Return (client, spreadsheet, sheet_id) or (None, None, msg) if misconfigured."""
     if not (gspread and Credentials):
-        return None, "gspread / google-auth not installed"
+        return None, None, "gspread / google-auth not installed"
 
-    # ---- sheet id ----
+    # Sheet ID
     sheet_id = None
     if hasattr(st, "secrets"):
         sheet_id = (
@@ -61,28 +66,27 @@ def _get_gsheet():
         )
     sheet_id = sheet_id or os.getenv("GOOGLE_SHEETS_SHEET_ID")
     if not sheet_id:
-        return None, "Missing GOOGLE_SHEETS_SHEET_ID"
+        return None, None, "Missing GOOGLE_SHEETS_SHEET_ID"
 
-    # ---- credentials ----
+    # Credentials
     creds_info = None
     if hasattr(st, "secrets"):
-        if "GOOGLE_SHEETS_JSON" in st.secrets:  # full JSON as a string
+        if "GOOGLE_SHEETS_JSON" in st.secrets:  # full JSON string
             try:
                 creds_info = json.loads(st.secrets["GOOGLE_SHEETS_JSON"])
             except json.JSONDecodeError:
-                return None, "GOOGLE_SHEETS_JSON is not valid JSON"
+                return None, None, "GOOGLE_SHEETS_JSON is not valid JSON"
         elif "gcp_service_account" in st.secrets:  # TOML table
             creds_info = dict(st.secrets["gcp_service_account"])
     if creds_info is None and os.getenv("GOOGLE_SHEETS_JSON"):
         try:
             creds_info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
         except json.JSONDecodeError:
-            return None, "Env GOOGLE_SHEETS_JSON is not valid JSON"
+            return None, None, "Env GOOGLE_SHEETS_JSON is not valid JSON"
 
     if not creds_info:
-        return None, "Missing service account JSON (GOOGLE_SHEETS_JSON or [gcp_service_account])"
+        return None, None, "Missing service account JSON (GOOGLE_SHEETS_JSON or [gcp_service_account])"
 
-    # Normalize the private key (common copy/paste issue)
     if "private_key" in creds_info and isinstance(creds_info["private_key"], str):
         creds_info["private_key"] = creds_info["private_key"].strip()
 
@@ -94,186 +98,90 @@ def _get_gsheet():
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         client = gspread.authorize(creds)
         sh = client.open_by_key(sheet_id)
+        return client, sh, sheet_id
+    except Exception as e:
+        return None, None, f"Auth/open failed: {e}"
+
+@st.cache_data(ttl=300)
+def _prices_df_from_sheet(prices_tab: str = PRICES_TAB) -> pd.DataFrame:
+    """Read 'prices' → canonical df with: date, symbol, close, (vol optional). Case-insensitive."""
+    _, sh, _ = _open_sheet()
+    if sh is None:
+        return pd.DataFrame()
+    try:
+        ws = sh.worksheet(prices_tab)
+    except Exception:
+        return pd.DataFrame()
+
+    vals = ws.get_all_values()
+    if not vals or len(vals) < 2:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Map common variants
+    if "adj close" in df.columns and "close" not in df.columns:
+        df = df.rename(columns={"adj close": "close"})
+    if "adj_close" in df.columns and "close" not in df.columns:
+        df = df.rename(columns={"adj_close": "close"})
+    if "volume" in df.columns and "vol" not in df.columns:
+        df = df.rename(columns={"volume": "vol"})
+
+    required = {"date", "symbol", "close"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    df["date"]   = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_localize(None)
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
+    df["close"]  = pd.to_numeric(df["close"], errors="coerce")
+    if "vol" in df.columns:
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values(["symbol", "date"]).reset_index(drop=True)
+    return df[["date", "symbol", "close"] + (["vol"] if "vol" in df.columns else [])]
+
+def _read_watchlist_symbols(worksheet: str = WATCHLIST_TAB, column: str = WATCHLIST_COL) -> List[str]:
+    _, sh, _ = _open_sheet()
+    if sh is None:
+        return []
+    try:
+        ws = sh.worksheet(worksheet)
+    except Exception:
+        return []
+    header = [h.strip() for h in ws.row_values(1)]
+    try:
+        idx = [h.lower() for h in header].index(column.lower()) + 1
+    except ValueError:
+        return []
+    syms = [s.strip().upper() for s in ws.col_values(idx)[1:] if s.strip()]
+    # Deduplicate
+    out, seen = [], set()
+    for t in syms:
+        if t not in seen:
+            out.append(t); seen.add(t)
+    return out
+
+def _ensure_logs_header(ws):
+    vals = ws.get_all_values()
+    if not vals or (vals and vals[0] != LOG_COLUMNS):
+        ws.update("A1", [LOG_COLUMNS])
+
+def _append_logs(rows: List[Dict]):
+    _, sh, _ = _open_sheet()
+    if sh is None: return
+    try:
         try:
             ws = sh.worksheet("logs")
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.sheet1
-
-        # ensure header row
-        values = ws.get_all_values()
-        if not values or values[0] != LOG_COLUMNS:
-            ws.update("A1", [LOG_COLUMNS])
-
-        return ws, getattr(creds, "service_account_email", "service-account")
-    except (gspread.exceptions.APIError,
-            gspread.exceptions.SpreadsheetNotFound,
-            OSError, ValueError) as e:
-        return None, f"Auth/open failed: {e}"
-
-
-def append_prediction_rows(rows: List[Dict]):
-    ws, _ = _get_gsheet()
-    if ws is None:
-        return
-    payload = [[r.get(k, "") for k in LOG_COLUMNS] for r in rows]
-    try:
-        ws.append_rows(payload, value_input_option="RAW")
-    except (gspread.exceptions.APIError, ValueError, TypeError):
-        # Log append errors are non-fatal to the app
+            ws = sh.add_worksheet(title="logs", rows=1000, cols=20)
+        _ensure_logs_header(ws)
+        payload = [[r.get(k, "") for k in LOG_COLUMNS] for r in rows]
+        if payload:
+            ws.append_rows(payload, value_input_option="RAW")
+    except Exception:
         pass
 
-
-# ---------- App config ----------
-st.set_page_config(page_title="AI Stock Trend Dashboard", layout="wide")
-st.title("📈 AI-Powered Stock Trend Dashboard")
-st.caption(
-    "Education only. Data: Yahoo (chart JSON). "
-    "Models: CNN-LSTM (default) with Linear MA10/MA50 fallback. "
-    "Auto-fetch primes once per session; use the button for ad-hoc refresh."
-)
-
-# ---------- Time window helpers (Pacific) ----------
-LA = ZoneInfo("America/Los_Angeles")
-WINDOWS_PT = [dtime(6, 30), dtime(12, 0)]
-WINDOW_WIDTH_MIN = 7
-
-
-def now_la() -> datetime:
-    return datetime.now(LA)
-
-
-def in_window() -> bool:
-    t = now_la()
-    for w in WINDOWS_PT:
-        start = t.replace(hour=w.hour, minute=w.minute, second=0, microsecond=0)
-        end = start + timedelta(minutes=WINDOW_WIDTH_MIN)
-        if start <= t <= end:
-            return True
-    return False
-
-
-def seconds_until_next_window() -> int:
-    t = now_la()
-    candidates = []
-    for w in WINDOWS_PT:
-        start = t.replace(hour=w.hour, minute=w.minute, second=0, microsecond=0)
-        if start > t:
-            candidates.append(start)
-    if not candidates:
-        w = WINDOWS_PT[0]
-        candidates.append((t + timedelta(days=1)).replace(hour=w.hour, minute=w.minute, second=0, microsecond=0))
-    return max(0, int((min(candidates) - t).total_seconds()))
-
-
-# ---------- Yahoo fetchers ----------
-@st.cache_data(ttl=600)
-def get_candles(symbol: str, days: int = 180, ignore_windows: bool = False) -> pd.DataFrame:
-    if not ignore_windows and not in_window():
-        raise RuntimeError("Outside fetch window")
-
-    url = YH_URL_BASE.format(symbol=symbol)
-    params = {"interval": "1d", "range": f"{days}d"}
-
-    try:
-        r = requests.get(url, params=params, headers=YH_HEADERS_DEFAULT, timeout=15)
-        r.raise_for_status()
-        j = r.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        raise RuntimeError(f"Yahoo request failed: {e}") from e
-
-    result = (j.get("chart", {}) or {}).get("result") or []
-    if not result:
-        raise RuntimeError("Yahoo candles: empty result")
-
-    res = result[0]
-    ts = res.get("timestamp")
-    q = (res.get("indicators", {}) or {}).get("quote", [{}])[0]
-    if not ts or not q:
-        raise RuntimeError("Yahoo candles: missing keys")
-
-    try:
-        df = pd.DataFrame({
-            "time": pd.to_datetime(ts, unit="s"),
-            "o": q.get("open"),
-            "h": q.get("high"),
-            "l": q.get("low"),
-            "close": q.get("close"),
-            "v": q.get("volume"),
-        }).dropna()
-        df.set_index("time", inplace=True)
-        return df[["o", "h", "l", "close", "v"]]
-    except (KeyError, ValueError, TypeError) as e:
-        raise RuntimeError(f"Yahoo candles: parse error: {e}") from e
-
-
-# ---------- History cache helpers ----------
-def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df with columns named: open, high, low, close, volume."""
-    d = df.copy()
-    if {"o", "h", "l", "close", "v"}.issubset(d.columns):
-        d = d.rename(columns={"o": "open", "h": "high", "l": "low", "v": "volume"})
-    elif {"Open", "High", "Low", "Close"}.issubset(d.columns):
-        d = d.rename(columns={"Open": "open", "High": "high", "Low": "low",
-                              "Close": "close", "Volume": "volume"})
-    return d
-
-
-def _put_cache(symbol: str, df: pd.DataFrame) -> pd.DataFrame:
-    st.session_state.setdefault("history_cache", {})[symbol] = df
-    return df
-
-
-def _get_cache(symbol: str) -> Optional[pd.DataFrame]:
-    return st.session_state.get("history_cache", {}).get(symbol)
-
-
-def fetch_history(symbol: str, days: int, *, allow_live_fallback: bool = True) -> Optional[pd.DataFrame]:
-    """
-    1) Return from our in-memory cache if present.
-    2) Else try the cached @st.cache_data call (respects windows).
-    3) Else (optionally) one-time live fetch with ignore_windows=True, then cache it.
-    """
-    df = _get_cache(symbol)
-    if df is not None and not df.empty:
-        return df
-
-    try:
-        df2 = get_candles(symbol, days=days)  # may raise if outside window
-        if df2 is not None and not df2.empty:
-            return _put_cache(symbol, df2)
-    except (RuntimeError, requests.exceptions.RequestException,
-            ValueError, KeyError):
-        pass
-
-    if allow_live_fallback and not st.session_state.get(f"_once_live_{symbol}", False):
-        try:
-            df3 = get_candles(symbol, days=days, ignore_windows=True)
-            st.session_state[f"_once_live_{symbol}"] = True
-            if df3 is not None and not df3.empty:
-                return _put_cache(symbol, df3)
-        except (RuntimeError, requests.exceptions.RequestException,
-                ValueError, KeyError):
-            st.session_state[f"_once_live_{symbol}"] = True
-
-    return None
-
-
-def prime_watchlist_cache(symbols: list[str], days: int) -> list[str]:
-    """Bulk live fetch (ignore windows) and put into cache. Returns list of successes."""
-    ok = []
-    for s in symbols:
-        try:
-            df = get_candles(s, days=days, ignore_windows=True)
-            if df is not None and not df.empty:
-                _put_cache(s, df)
-                ok.append(s)
-        except (RuntimeError, requests.exceptions.RequestException,
-                ValueError, KeyError):
-            pass
-    return ok
-
-
-# ---------- Model helpers ----------
+# ---------- Model loaders ----------
 @st.cache_resource(show_spinner=False)
 def load_cnn_lstm(symbol: Optional[str] = None):
     if tf is None:
@@ -285,16 +193,16 @@ def load_cnn_lstm(symbol: Optional[str] = None):
     for p in candidates:
         if p.exists():
             try:
-                model = tf.keras.models.load_model(p)
+                m = tf.keras.models.load_model(p)
                 st.session_state["cnn_model_path"] = str(p)
-                return model
-            except (OSError, IOError, ValueError) as e:
-                st.warning(f"Found {p.name} but failed to load model: {e}")
+                return m
+            except Exception as e:
+                st.warning(f"Found {p.name} but failed to load: {e}")
     return None
 
-
 @st.cache_resource(show_spinner=False)
-def load_scaler():
+def load_scaler_and_feats() -> Optional[Tuple[object, List[str]]]:
+    """Return (scaler, feats_order) saved during training, or None if missing."""
     for p in [
         Path("models") / "scaler_ALL.pkl",
         Path("models") / "scaler.pkl",
@@ -304,372 +212,365 @@ def load_scaler():
         if p.exists():
             try:
                 obj = joblib.load(p)
-                if isinstance(obj, dict) and "scaler" in obj:
-                    obj = obj["scaler"]
-                return obj
-            except (OSError, IOError, ValueError) as e:
-                st.warning(f"Found {p.name} but failed to load scaler: {e}")
+                if isinstance(obj, dict) and "scaler" in obj and "feats" in obj:
+                    return obj["scaler"], list(obj["feats"])
+                # Fallbacks if stored differently
+                if isinstance(obj, dict) and "feats" in obj:
+                    scaler = obj.get("scaler") or obj.get("minmax") or obj.get("mm")
+                    return scaler, list(obj["feats"])
+                if hasattr(obj, "transform"):
+                    # Unknown feats; assume ['close'] to avoid crash
+                    return obj, ["close"]
+            except Exception as e:
+                st.warning(f"Failed to load scaler/features from {p.name}: {e}")
     return None
-
 
 @st.cache_resource(show_spinner=False)
 def load_linear_model():
-    """Load a pre-trained LinearRegression model once."""
     for p in [Path("models") / "linear_model.pkl", Path("linear_model.pkl")]:
         if p.exists():
             try:
                 return joblib.load(p)
-            except (OSError, IOError, ValueError) as e:
+            except Exception as e:
                 st.warning(f"Failed to load linear model from {p.name}: {e}")
                 return None
-    # Not fatal, just means Linear fallback won't run
     return None
 
-def predict_linear(df_features: pd.DataFrame):
-    mdl = load_linear_model()
-    if mdl is None or df_features.empty:
-        return Non
-        X_last = df_features.iloc[[-1]][["MA10","MA50"]].to_numpy(dtype=float)
-        return float(mdl.predict(X_last)[0])
-
-
-# -------- Robust scaler utilities --------
-def _scaler_can_api(s) -> bool:
-    return hasattr(s, "transform") and hasattr(s, "inverse_transform")
-
-def _dig(d: dict, *keys):
-    """Safely dig into nested dicts."""
-    cur = d
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return None
-    return cur
-
-def _scaler_get_scale_min(s):
+# ---------- Training feature engineering (matches train.py) ----------
+def _build_training_features_from_prices(df_prices: pd.DataFrame) -> pd.DataFrame:
     """
-    Return (scale_, min_) as numpy arrays if available.
-    Supports:
-      - real MinMaxScaler (attrs)
-      - dict with scale_/min_
-      - dict with nested {"params": {...}} or {"state": {...}}
-      - dict with only data_min_/data_max_ (+feature_range) -> derive scale_/min_
+    Input columns (lower-case): date(index or col), symbol(optional), close, (vol optional).
+    Output: adds ret1, ma10, ma50, vlog -> drops NaNs.
     """
-    # Real sklearn scaler
-    try:
-        if hasattr(s, "scale_") and hasattr(s, "min_"):
-            return np.asarray(s.scale_), np.asarray(s.min_)
-    except Exception:
-        pass
+    df = df_prices.copy()
+    if "vol" not in df.columns:
+        df["vol"] = 0.0
+    df["ret1"] = df["close"].pct_change()
+    df["ma10"] = df["close"].rolling(10).mean()
+    df["ma50"] = df["close"].rolling(50).mean()
+    df["vlog"] = np.log1p(df["vol"])
+    return df.dropna()
 
-    # Dict forms (flat or nested)
-    if isinstance(s, dict):
-        for node in (s, _dig(s, "params"), _dig(s, "state")):
-            if isinstance(node, dict):
-                # Direct scale_/min_
-                if "scale_" in node and "min_" in node:
-                    return np.asarray(node["scale_"]), np.asarray(node["min_"])
-                if "scale" in node and "min" in node:
-                    return np.asarray(node["scale"]), np.asarray(node["min"])
-                # Derive from data_min_, data_max_, feature_range
-                dmin = node.get("data_min_")
-                dmax = node.get("data_max_")
-                drng = node.get("data_range_")
-                fr = node.get("feature_range", (0.0, 1.0))
-                if dmin is not None and (dmax is not None or drng is not None):
-                    dmin = np.asarray(dmin, dtype=float)
-                    if drng is None:
-                        dmax = np.asarray(dmax, dtype=float)
-                        drng = dmax - dmin
-                    else:
-                        drng = np.asarray(drng, dtype=float)
-                    fr0, fr1 = float(fr[0]), float(fr[1])
-                    scale_ = (fr1 - fr0) / drng
-                    min_ = fr0 - dmin * scale_
-                    return scale_, min_
+def _inverse_close_only(pred_scaled: np.ndarray, scaler, feats_order: List[str]) -> np.ndarray:
+    """Invert MinMax scaling for the 'close' feature."""
+    # scikit-learn MinMaxScaler:
+    if hasattr(scaler, "data_min_") and hasattr(scaler, "data_range_"):
+        close_idx = feats_order.index("close")
+        data_min = scaler.data_min_[close_idx]
+        data_rng = scaler.data_range_[close_idx]
+        return pred_scaled * data_rng + data_min
+    # If custom scaler dict with scale_/min_
+    if hasattr(scaler, "scale_") and hasattr(scaler, "min_"):
+        # y_scaled = y*scale + min -> y = (y_scaled - min)/scale
+        close_idx = feats_order.index("close")
+        return (pred_scaled - scaler.min_[close_idx]) / scaler.scale_[close_idx]
+    return pred_scaled  # last resort (no-op)
 
-    return None, None
-
-
-# ---------- Features + models ----------
-def featurize(df: pd.DataFrame) -> pd.DataFrame:
-    out = _normalize_ohlcv(df)
-    if 'close' not in out.columns:
-        return pd.DataFrame()
-    out["MA10"] = out["close"].rolling(10).mean()
-    out["MA50"] = out["close"].rolling(50).mean()
-    return out.dropna()
-
-
-def fit_and_predict(df_features: pd.DataFrame) -> Optional[float]:
-    """Predict with a pre-trained LinearRegression saved as linear_model.pkl."""
-    if df_features is None or df_features.empty:
-        return None
-    model = load_linear_model()
-    if model is None:
-        # Informative but non-fatal
-        st.info("Linear model file not found (models/linear_model.pkl).")
-        return None
-    try:
-        x_last = df_features.iloc[[-1]][["MA10", "MA50"]]
-        pred = float(model.predict(x_last)[0])
-        return pred
-    except (KeyError, ValueError) as e:
-        st.warning(f"Linear predict failed: {e}")
-        return None
-
-
-def predict_next_close_cnnlstm(symbol: str, df: pd.DataFrame, lookback: int = DEFAULT_LOOKBACK):
+# ---------- Price access (Sheets) ----------
+@st.cache_data(ttl=300)
+def fetch_history(symbol: str, days: int, prices_tab: str = PRICES_TAB) -> Optional[pd.DataFrame]:
     """
-    Robust CNN-LSTM predictor that supports:
-      • 5-feature OHLCV models, or
-      • 1-feature (close-only) models
-    and works with either a real MinMaxScaler OR a dict with scale_/min_ (or data_min_/data_max_).
+    Read from Google Sheets 'prices' tab, filter to symbol & last N days.
+    Returns columns: close, (vol), indexed by date.
+    """
+    df_all = _prices_df_from_sheet(prices_tab)
+    if df_all is None or df_all.empty:
+        return None
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
+    d = df_all[(df_all["symbol"] == symbol.upper()) & (df_all["date"] >= cutoff)].copy()
+    if d.empty:
+        return None
+    d = d.set_index("date").sort_index()  # keep lower-case columns: close, vol?
+    return d  # columns: close, (vol)
+
+# ---------- Predictors ----------
+def predict_multi_cnnlstm(symbol: str, df_prices: pd.DataFrame,
+                          lookback: int = DEFAULT_LOOKBACK) -> Optional[Tuple[np.ndarray, float, List[str]]]:
+    """
+    Return (predicted_closes[horizons], last_close, feats_order) using the real training features & scaler.
+    df_prices: must contain 'close' (and ideally 'vol'); index is datetime ascending.
     """
     if tf is None:
         return None
-
     model = load_cnn_lstm(symbol)
-    if model is None:
+    sf = load_scaler_and_feats()
+    if model is None or sf is None:
+        return None
+    scaler, feats_order = sf
+
+    # Prepare features exactly like training
+    feat = _build_training_features_from_prices(
+        pd.DataFrame({
+            "close": df_prices["close"].astype(float).values,
+            "vol": (df_prices["vol"].astype(float).values if "vol" in df_prices.columns else np.zeros(len(df_prices))),
+        }, index=df_prices.index)
+    )
+
+    if len(feat) < lookback:
         return None
 
-    # Normalize + clean
-    d = _normalize_ohlcv(df).dropna(subset=FEATURE_COLS)
-    if len(d) < lookback:
-        return None
-
-    scaler = load_scaler()
-    if scaler is None:
-        return None
-
-    # Expected feature count
+    # Scale in the same order used during training
     try:
-        n_feats = int(model.input_shape[-1])
+        feat_scaled = feat.copy()
+        feat_scaled[feats_order] = scaler.transform(feat_scaled[feats_order].values)
     except Exception:
-        n_feats = 5
-
-    scale_, min_ = _scaler_get_scale_min(scaler)
-
-    try:
-        if n_feats == 1:
-            seq = d["close"].tail(lookback).to_numpy().reshape(-1, 1)  # (L,1)
-            if scale_ is not None and min_ is not None:
-                X = (seq * scale_[CLOSE_IDX] + min_[CLOSE_IDX])[np.newaxis, :, :]  # (1,L,1)
-            elif _scaler_can_api(scaler):
-                X = scaler.transform(seq)[np.newaxis, :, :]
-            else:
-                return None
-        else:
-            block = d[FEATURE_COLS].tail(lookback).to_numpy()  # (L,5)
-            if scale_ is not None and min_ is not None:
-                block_scaled = block * scale_ + min_
-            elif _scaler_can_api(scaler):
-                block_scaled = scaler.transform(block)
-            else:
-                return None
-            X = block_scaled[np.newaxis, :, :]
-    except (ValueError, KeyError, TypeError):
-        return None
-
-    # Predict scaled close
-    try:
-        y_scaled = float(model.predict(X, verbose=0)[0][0])
-    except (ValueError, TypeError) as e:
-        return None
-
-    # Inverse transform the close
-    try:
-        if scale_ is not None and min_ is not None:
-            # y_scaled = y*scale + min  => y = (y_scaled - min)/scale
-            return float((y_scaled - min_[CLOSE_IDX]) / scale_[CLOSE_IDX])
-        elif _scaler_can_api(scaler):
-            dummy = np.zeros((1, len(FEATURE_COLS)), dtype=float)
-            dummy[0, CLOSE_IDX] = y_scaled
-            return float(scaler.inverse_transform(dummy)[0, CLOSE_IDX])
-        else:
+        # If scaler is dict-like, try best-effort
+        try:
+            feat_scaled = feat.copy()
+            feat_scaled[feats_order] = scaler.transform(feat_scaled[feats_order])
+        except Exception:
             return None
-    except (ValueError, TypeError):
+
+    X = feat_scaled[feats_order].tail(lookback).to_numpy(dtype=np.float32)[np.newaxis, :, :]  # (1,L,F)
+    if X.shape[1] != lookback:
         return None
 
+    try:
+        y_scaled = model.predict(X, verbose=0)[0]  # shape (n_horizons,)
+    except Exception:
+        return None
 
-# ---------- Sidebar / Controls ----------
-default_watchlist = ["AAPL", "MSFT", "GOOGL", "TSLA"]
+    preds = _inverse_close_only(np.asarray(y_scaled, dtype=float), scaler, feats_order)
+    last_close = float(feat["close"].iloc[-1])
+    return preds, last_close, feats_order
+
+def predict_next_close_linear(df_prices: pd.DataFrame) -> Optional[float]:
+    """Simple fallback using MA10/MA50 and a pre-trained LinearRegression."""
+    mdl = load_linear_model()
+    if mdl is None or df_prices is None or df_prices.empty or "close" not in df_prices.columns:
+        return None
+    tmp = df_prices.copy()
+    tmp["MA10"] = tmp["close"].rolling(10).mean()
+    tmp["MA50"] = tmp["close"].rolling(50).mean()
+    tmp = tmp.dropna()
+    if tmp.empty:
+        return None
+    try:
+        X_last = tmp.iloc[[-1]][["MA10","MA50"]].to_numpy(dtype=float)
+        return float(mdl.predict(X_last)[0])
+    except Exception:
+        return None
+
+# ---------- Predictions sheet writer ----------
+def _ensure_predictions_header(ws):
+    header = [
+        "timestamp_utc","symbol","horizon","last_close","predicted",
+        "pct_change","signal","scope","model_kind","params_json",
+        "train_window","features","actual"
+    ]
+    vals = ws.get_all_values()
+    if not vals:
+        ws.update("A1", [header])
+
+def append_predictions_rows(rows: List[List]):
+    """Append rows to predictions tab, creating it (and header) if needed."""
+    _, sh, _ = _open_sheet()
+    if sh is None: return
+    try:
+        try:
+            ws = sh.worksheet(PREDICTIONS_TAB)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=PREDICTIONS_TAB, rows=2000, cols=20)
+            _ensure_predictions_header(ws)
+        _ensure_predictions_header(ws)
+        for i in range(0, len(rows), 800):
+            ws.append_rows(rows[i:i+800], value_input_option="USER_ENTERED")
+    except Exception:
+        pass
+
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Controls")
-    watchlist = st.multiselect("Watchlist", default_watchlist, default=default_watchlist)
-    days = st.slider("History (days)", 90, 365, 180, step=5)
-    alert_pct = st.slider("Alert threshold (%)", 0.5, 5.0, 2.0, step=0.25)
 
-    st.subheader("Model")
+    # Try to use watchlist from Google Sheet
+    sheet_syms = _read_watchlist_symbols(WATCHLIST_TAB, WATCHLIST_COL)
+    default_watchlist = sheet_syms if sheet_syms else ["AAPL", "MSFT", "GOOGL", "TSLA"]
+
+    manual = st.text_input(
+        "Watchlist (comma-separated, overrides sheet)",
+        value=",".join(default_watchlist)
+    )
+    watchlist = [s.strip().upper() for s in manual.split(",") if s.strip()]
+
+    days = st.slider("History window (days)", 60, 3650, 365, step=5)
+    alert_pct = st.slider("Alert threshold (%)", 0.5, 10.0, 2.0, step=0.25)
+
+    MODEL_CNN = "CNN-LSTM (multi-horizon)"
     MODEL_LINEAR = "Linear (MA10/MA50)"
-    MODEL_CNN = "CNN-LSTM (pretrained)"
-    # Default to CNN-LSTM (index=1)
     model_choice = st.selectbox(
-        "Choose model",
-        (MODEL_LINEAR, MODEL_CNN),
-        index=1,
-        help="Linear is simple; CNN-LSTM uses a pretrained deep model (falls back to Linear if unavailable)."
+        "Table model",
+        (MODEL_CNN, MODEL_LINEAR),
+        index=0,
+        help="CNN-LSTM uses your trained deep model; Linear is a simple fallback for the table."
     )
     st.session_state["model_choice"] = model_choice
 
-    mins = seconds_until_next_window() // 60
-    if in_window():
-        st.success("✅ Inside fetch window (PT). Live pulls allowed.")
-    else:
-        st.info(f"🕰️ Outside fetch window. Using cache if available. Next window in ~{mins} min.")
-
+    if st.button("🔄 Reload prices cache from Google Sheets"):
+        _prices_df_from_sheet.clear()
+        fetch_history.clear()
+        st.success("Reloaded prices cache.")
 
 def using_cnn() -> bool:
-    return st.session_state.get("model_choice") == "CNN-LSTM (pretrained)"
+    return st.session_state.get("model_choice") == "CNN-LSTM (multi-horizon)"
 
-
-# ---------- Auto-prime once per session ----------
-if not st.session_state.get("_session_primed", False):
-    st.session_state["_session_primed"] = True
-    if watchlist:
-        with st.spinner("Priming cache for your watchlist (one-time)…"):
-            try:
-                prime_watchlist_cache(watchlist, days)
-            except (RuntimeError, requests.exceptions.RequestException) as e:
-                st.warning(f"Auto-prime skipped: {e}")
-
-
-# ---------- Diagnostics / Integrations ----------
-with st.expander("🔧 Diagnostics & Integrations", expanded=False):
-    st.write("Now (PT):", now_la().strftime("%Y-%m-%d %H:%M:%S"))
-    st.write("In window:", in_window())
-    st.write("Next window (min):", seconds_until_next_window() // 60)
-
-    # Model status
-    mdl = load_cnn_lstm()
-    st.write("CNN-LSTM loaded:", bool(mdl))
-    if mdl:
-        try:
-            st.write("Model input shape:", mdl.input_shape)
-            st.write("Model expects features:", int(mdl.input_shape[-1]))
-        except Exception:
-            pass
-
-    # Scaler status
-    sc = load_scaler()
-    st.write("Scaler loaded:", bool(sc))
-    st.write("Scaler has API:", hasattr(sc, "transform") and hasattr(sc, "inverse_transform"))
-
-    # Linear model status
-    lin = load_linear_model()
-    st.write("Linear model loaded:", bool(lin))
-
-    # Google Sheets
-    ws, info = _get_gsheet()
-    if ws is None:
-        st.write("Google Sheets: not configured –", info)
-    else:
-        st.write("Google Sheets: connected ✅")
-        st.write("Worksheet:", ws.title)
-        st.write("Service account:", info)
-
-
-# ---------- Refresh watchlist (ad-hoc) ----------
-with st.container():
-    if st.button(
-        "🔄 Refresh watchlist (live fetch ALL now)",
-        help="Fetch fresh candles for every symbol once, ignoring the time windows."
-    ):
-        if not watchlist:
-            st.info("Your watchlist is empty.")
-        else:
-            with st.spinner("Fetching fresh data…"):
-                prime_watchlist_cache(watchlist, days)
-
-
-# ---------- Watchlist scoring / table ----------
+# ---------- Score watchlist (UI table) ----------
 rows: List[Dict] = []
+logs: List[Dict] = []
 
-with st.spinner("Scoring watchlist…"):
-    for s in (watchlist or []):
+with st.spinner("Scoring watchlist from Google Sheets…"):
+    for sym in (watchlist or []):
         try:
-            # Prefer cache / normal path, then (if needed) one-shot live fallback
-            d = fetch_history(s, days, allow_live_fallback=False)
-            if d is None or d.empty:
-                d = fetch_history(s, days, allow_live_fallback=True)
-            if d is None or d.empty:
-                raise RuntimeError("no history")
+            d = fetch_history(sym, days)  # columns: close,(vol), index=date
+            if d is None or d.empty or "close" not in d.columns:
+                raise RuntimeError("No price rows in 'prices' for symbol")
 
-            dN = _normalize_ohlcv(d)
-            if "close" not in dN.columns:
-                raise KeyError("missing 'close'")
-
-            last_close = float(dN["close"].iloc[-1])
-
-            model_used_row = "—"
+            last_close = float(d["close"].iloc[-1])
+            model_used = "—"
             next_pred = None
 
             if using_cnn():
-                next_pred = predict_next_close_cnnlstm(s, dN, lookback=DEFAULT_LOOKBACK)
-                if next_pred is not None:
-                    model_used_row = "CNN-LSTM"
+                res = predict_multi_cnnlstm(sym, d, lookback=DEFAULT_LOOKBACK)
+                if res is not None:
+                    preds_vec, _, _ = res
+                    if preds_vec.size > 0:
+                        next_pred = float(preds_vec[0])  # 1-day ahead for the table
+                        model_used = "CNN-LSTM"
 
             if next_pred is None:
-                feat_row = featurize(dN)
-                lin_pred = fit_and_predict(feat_row)
-                if lin_pred is not None:
-                    next_pred = lin_pred
-                    model_used_row = "Linear (fallback)"
+                lin = predict_next_close_linear(d)
+                if lin is not None:
+                    next_pred = lin
+                    model_used = "Linear (fallback)"
 
-            if next_pred is None:
-                # Last resort so the table always fills (0% change)
+            if next_pred is None:  # Naive
                 next_pred = last_close
-                model_used_row = "Naive"
+                model_used = "Naive"
 
             ret = 100.0 * (float(next_pred) - last_close) / last_close
             signal = "BUY↑" if ret >= alert_pct else ("SELL↓" if ret <= -alert_pct else "HOLD")
 
             rows.append({
-                "Symbol": s,
+                "Symbol": sym,
                 "Last": round(last_close, 2),
                 "Predicted": round(float(next_pred), 2),
                 "Δ%": round(float(ret), 2),
                 "Signal": signal,
-                "Model": model_used_row
+                "Model": model_used
             })
-        except (RuntimeError, KeyError, ValueError,
-                requests.exceptions.RequestException):
+
+            logs.append({
+                "ts_utc": pd.Timestamp.utcnow().replace(microsecond=0).isoformat() + "Z",
+                "symbol": sym,
+                "model": model_used,
+                "lookback": DEFAULT_LOOKBACK if "CNN" in model_used else "",
+                "days_history": days,
+                "last_close": round(last_close, 6),
+                "predicted": round(float(next_pred), 6),
+                "pct_change": round(float(ret), 4),
+                "note": "watchlist"
+            })
+
+        except Exception:
             rows.append({
-                "Symbol": s,
+                "Symbol": sym,
                 "Last": None, "Predicted": None, "Δ%": None,
                 "Signal": "ERR", "Model": "—"
             })
 
 st.subheader("Watchlist signals")
-
 if rows:
     table = pd.DataFrame(rows).set_index("Symbol").sort_values("Δ%", ascending=False, na_position="last")
     st.dataframe(table, use_container_width=True)
-
-    # Optional: log predictions to Google Sheets
-    try:
-        to_log = []
-        for r in rows:
-            if r.get("Predicted") is None or r.get("Last") is None:
-                continue
-            to_log.append({
-                "ts_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                "ts_pt": now_la().strftime("%Y-%m-%d %H:%M:%S"),
-                "symbol": r["Symbol"],
-                "model": r["Model"],
-                "lookback": (DEFAULT_LOOKBACK if "CNN" in (r["Model"] or "") else ""),
-                "days_history": days,
-                "last_close": r["Last"],
-                "predicted": r["Predicted"],
-                "pct_change": r["Δ%"],
-                "in_window": in_window(),
-                "ma10": "", "ma50": "",
-                "note": "watchlist",
-            })
-        if to_log:
-            append_prediction_rows(to_log)
-    except (gspread.exceptions.APIError, ValueError, TypeError):
-        pass
 else:
     st.info("Your watchlist is empty. Add symbols in the sidebar.")
+
+# Optional: append table logs (non-fatal)
+if logs:
+    _append_logs(logs)
+
+# ---------- Button: write per-horizon predictions to 'predictions' ----------
+st.markdown("---")
+st.subheader("✍️ Generate multi-horizon predictions → Google Sheets")
+
+colA, colB = st.columns([1, 3])
+with colA:
+    write_btn = st.button("Write predictions (1,3,5,10,20 days)")
+
+with colB:
+    st.caption(
+        "Writes rows to the **'predictions'** worksheet using your **CNN-LSTM** model, "
+        "matching the nightly workflow format (timestamp_utc, symbol, horizon, last_close, predicted, …). "
+        "If CNN-LSTM or scaler/feats are missing, nothing will be written."
+    )
+
+if write_btn:
+    wrote = 0
+    missing = []
+    for sym in (watchlist or []):
+        try:
+            d = fetch_history(sym, days)
+            if d is None or d.empty or "close" not in d.columns:
+                missing.append(sym); continue
+
+            res = predict_multi_cnnlstm(sym, d, lookback=DEFAULT_LOOKBACK)
+            if res is None:
+                missing.append(sym); continue
+
+            preds_vec, last_close, feats_order = res
+            now_iso = pd.Timestamp.utcnow().replace(microsecond=0).isoformat() + "Z"
+            rows_out: List[List] = []
+            for h, p in zip(HORIZONS_DEFAULT, preds_vec[:len(HORIZONS_DEFAULT)]):
+                p = float(p)
+                pct = 0.0 if last_close == 0 else (p - last_close) / last_close * 100.0
+                signal = 1 if p > last_close else (-1 if p < last_close else 0)
+                params_json = json.dumps({"horizons": HORIZONS_DEFAULT})
+                rows_out.append([
+                    now_iso, sym, h, round(last_close, 6), round(p, 6),
+                    round(pct, 4), signal, "APP", "CNN-LSTM",
+                    params_json, DEFAULT_LOOKBACK, ",".join(feats_order), ""
+                ])
+            if rows_out:
+                append_predictions_rows(rows_out)
+                wrote += len(rows_out)
+        except Exception:
+            missing.append(sym)
+
+    if wrote > 0:
+        st.success(f"Wrote {wrote} prediction rows to '{PREDICTIONS_TAB}'.")
+    if missing:
+        st.warning(f"Skipped (no data or model): {', '.join(missing[:12])}{'…' if len(missing)>12 else ''}")
+
+# ---------- Diagnostics ----------
+with st.expander("🔧 Diagnostics", expanded=False):
+    client, sh, sid = _open_sheet()
+    if sh is not None:
+        st.write("Google Sheets: connected ✅")
+        st.write("Spreadsheet ID:", sid)
+        try:
+            ws_names = [ws.title for ws in sh.worksheets()]
+            st.write("Worksheets:", ", ".join(ws_names))
+        except Exception:
+            pass
+    else:
+        st.write("Google Sheets: not connected — check secrets (GOOGLE_SHEETS_JSON) and sheet id.")
+
+    mdl = load_cnn_lstm()
+    st.write("CNN-LSTM loaded:", bool(mdl))
+    if mdl:
+        try:
+            st.write("Model input shape:", mdl.input_shape)
+        except Exception:
+            pass
+
+    sf = load_scaler_and_feats()
+    st.write("Scaler+feats loaded:", bool(sf))
+    if sf:
+        s, feats = sf
+        st.write("Training feature order:", feats)
+
+    lin = load_linear_model()
+    st.write("Linear model loaded:", bool(lin))
+
+    prices_sample = _prices_df_from_sheet().head(5)
+    st.write("Prices sample (from sheet):")
+    st.dataframe(prices_sample if not prices_sample.empty else pd.DataFrame({"status":["(empty)"]}))
