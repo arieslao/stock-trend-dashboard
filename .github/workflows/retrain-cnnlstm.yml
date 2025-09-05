@@ -117,22 +117,35 @@ jobs:
             models/cnn_lstm_ALL.keras
             models/scaler_ALL.pkl
 
+            
+
+      
       - name: Commit model artifacts to main
         if: steps.train.outcome == 'success'
         env:
           BRANCH: main
         run: |
           set -euxo pipefail
+      
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
+      
+          # Stage the updated model files
           git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl || true
+      
+          # If nothing changed, exit quietly
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-
-          git fetch origin $BRANCH
-          git pull --rebase origin $BRANCH
+      
+          # 1) Commit FIRST
           git commit -m "Update CNN-LSTM weights ($(date -u +%F))"
+      
+          # 2) Now update local main and rebase our commit(s)
+          git fetch origin $BRANCH
+          git rebase origin/$BRANCH
+      
+          # 3) Push safely
           git push --force-with-lease origin HEAD:$BRANCH
+      
