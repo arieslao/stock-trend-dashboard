@@ -7,7 +7,7 @@ plotly==5.22.0
 requests==2.32.3
 joblib==1.4.2
 yfinance==0.2.44
-
+oauth2client
 
 # Google Sheets
 gspread==6.1.2
