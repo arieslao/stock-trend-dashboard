@@ -92,20 +92,20 @@ def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
 def make_features(df):
     df = df.copy()
     # base features
-    df["ret1"] = df.groupby("Symbol")["Close"].pct_change()
-    df["ma10"] = df.groupby("Symbol")["Close"].transform(lambda s: s.rolling(10).mean())
-    df["ma50"] = df.groupby("Symbol")["Close"].transform(lambda s: s.rolling(50).mean())
+    df["ret1"] = df.groupby("Symbol")["close"].pct_change()
+    df["ma10"] = df.groupby("Symbol")["close"].transform(lambda s: s.rolling(10).mean())
+    df["ma50"] = df.groupby("Symbol")["close"].transform(lambda s: s.rolling(50).mean())
     df["vlog"] = np.log1p(df["Volume"])
     # extra features (lift accuracy, still cheap)
     df["volatility20"] = df.groupby("Symbol")["ret1"].transform(lambda s: s.rolling(20).std())
-    df["momentum10"]   = df.groupby("Symbol")["Close"].transform(lambda s: s.pct_change(10))
+    df["momentum10"]   = df.groupby("Symbol")["close"].transform(lambda s: s.pct_change(10))
     return df.dropna()
 
 def last_window_tensor(df_feat, feats_order, window=60):
     if len(df_feat) < window:
         return None, None
     X = df_feat.iloc[-window:][feats_order].values.astype(np.float32)
-    last_close_raw = float(df_feat.iloc[-1]["Close_raw"])
+    last_close_raw = float(df_feat.iloc[-1]["close_raw"])
     return X, last_close_raw
 
 def inverse_close_only(pred_scaled, scaler, feats_order):
@@ -183,7 +183,7 @@ def main():
     raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, args.period)
     if raw.empty:
         raise SystemExit("No rows in 'prices' for requested symbols/period")
-    raw["Close_raw"] = raw["Close"]
+    raw["close_raw"] = raw["close"]
     feat = make_features(raw)
 
     # artifacts
@@ -203,10 +203,10 @@ def main():
 
     for sym, g in feat_scaled.groupby("Symbol"):
         g_raw = feat[feat["Symbol"]==sym].copy()
-        g_raw["Close_raw"] = raw[raw["Symbol"]==sym]["Close"].values[-len(g_raw):]
+        g_raw["close_raw"] = raw[raw["Symbol"]==sym]["close"].values[-len(g_raw):]
 
         X, last_close = last_window_tensor(
-            pd.concat([g, g_raw[["Close_raw"]]], axis=1),
+            pd.concat([g, g_raw[["close_raw"]]], axis=1),
             feats_order, WINDOW
         )
         if X is None:
