@@ -28,37 +28,71 @@ def main():
     gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
     sh = gc.open_by_key(args.sheet_id)
 
-    # prices
+    # prices (robust to header casing and variants)
     wprices = sh.worksheet(args.prices_worksheet)
-    v = wprices.get_all_values()
-    phead = [h.strip() for h in v[0]]
-    pi = {c: phead.index(c) for c in phead}
-    rows = v[1:]
-    pdf = pd.DataFrame([[r[pi["Date"]], r[pi["Symbol"]], r[pi["Close"]]] for r in rows],
-                       columns=["Date","Symbol","Close"])
-    pdf["Date"]  = pd.to_datetime(pdf["Date"], errors="coerce", utc=True).dt.tz_localize(None)
-    pdf["Close"] = pd.to_numeric(pdf["Close"], errors="coerce")
-    pdf["Symbol"]= pdf["Symbol"].astype(str).str.upper()
-    pdf = pdf.dropna(subset=["Date","Close"]).sort_values(["Symbol","Date"])
+    vals = wprices.get_all_values()
+    if not vals or len(vals) < 2:
+        raise RuntimeError(f"'{args.prices_worksheet}' is empty or missing headers")
+    
+    prices = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
+    # normalize headers to lowercase
+    prices.columns = [c.strip().lower() for c in prices.columns]
+    
+    # map common variants to model-expected names
+    rename_map = {}
+    if "adj close" in prices.columns and "close" not in prices.columns:
+        rename_map["adj close"] = "close"
+    if "volume" in prices.columns and "vol" not in prices.columns:
+        rename_map["volume"] = "vol"
+    if rename_map:
+        prices = prices.rename(columns=rename_map)
+    
+    required = {"date", "symbol", "close"}
+    missing = required - set(prices.columns)
+    if missing:
+        raise RuntimeError(
+            f"'${args.prices_worksheet}' missing required columns: {missing}. "
+            f"Found: {list(prices.columns)}"
+        )
+    
+    # types & cleaning
+    prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce").dt.tz_localize(None)
+    prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
+    if "vol" in prices.columns:
+        prices["vol"] = pd.to_numeric(prices["vol"], errors="coerce")
+    
+    prices["symbol"] = prices["symbol"].astype(str).str.upper().str.strip()
+    prices = prices.dropna(subset=["date", "close"]).sort_values(["symbol", "date"])
+    
+    # keep a canonical name matching the rest of the code
+    pdf = prices
+
 
     # predictions
+    # predictions (make header handling case-insensitive)
     wpred = sh.worksheet(args.predictions_worksheet)
-    vals = wpred.get_all_values()
-    header = [h.strip() for h in vals[0]]
-    need_cols = ["due_date", "error_pct", "direction_hit", "evaluated_at_utc"]
-    header, hi = ensure_cols(wpred, header, need_cols)
-    vals = wpred.get_all_values()
-    header = [h.strip() for h in vals[0]]
-    hi = {c: header.index(c) for c in header}
-    rows = vals[1:]
+    vals  = wpred.get_all_values()
+    if not vals or len(vals) < 2:
+        raise RuntimeError(f"'{args.predictions_worksheet}' is empty or missing headers")
+    
+    # Keep your helper working with the original header (some sheets may not yet have the eval columns)
+    header_orig = [h.strip() for h in vals[0]]
+    need_cols   = ["due_date", "error_pct", "direction_hit", "evaluated_at_utc"]
+    # Ensure those columns exist (function may update the sheet); ignore returned header to keep behavior
+    _ = ensure_cols(wpred, header_orig, need_cols)
+    
+    # Refresh after potential edits and build a LOWER-CASED header + index map
+    vals       = wpred.get_all_values()
+    header_lc  = [h.strip().lower() for h in vals[0]]
+    hi         = {c: header_lc.index(c) for c in header_lc}
+    rows       = vals[1:]
+    
+    # Required base columns for matching/updates (lower-case names)
+    req = ["timestamp_utc", "symbol", "horizon", "last_close", "predicted", "signal", "actual"]
+    missing = [c for c in req if c not in hi]
+    if missing:
+        raise SystemExit(f"'{args.predictions_worksheet}' missing {missing}")
 
-    req = ["timestamp_utc","symbol","horizon","last_close","predicted","signal","actual"]
-    for c in req:
-        if c not in header:
-            raise SystemExit(f"'{args.predictions_worksheet}' missing '{c}'")
-
-    updates = []
-    now = pd.Timestamp.utcnow().tz_localize(None)
 
     for r_idx, r in enumerate(rows, start=2):
         sym = str(r[hi["symbol"]]).strip().upper()
