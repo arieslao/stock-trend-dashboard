@@ -2,8 +2,12 @@ name: Nightly CNN-LSTM Train
 
 on:
   schedule:
-    - cron: "30 2 * * *"   # 02:30 UTC daily
+    - cron: "30 2 * * *"     # 02:30 UTC daily
   workflow_dispatch: {}
+
+concurrency:
+  group: model-artifacts
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -13,13 +17,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repo
+      - name: Check out repo (full history so push works)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"   # TensorFlow 2.15 works well on 3.10
+          python-version: "3.10"
 
       - name: Install deps
         run: |
@@ -35,7 +41,7 @@ jobs:
           python - <<'PY'
           import json, os
           p = os.path.join(os.environ["RUNNER_TEMP"], "sa.json")
-          json.load(open(p))
+          json.load(open(p))  # validate
           print("Service account JSON OK:", p)
           PY
 
@@ -46,7 +52,6 @@ jobs:
           set -euxo pipefail
           mkdir -p "$HOME/.config/gspread"
           echo "$GOOGLE_SHEETS_JSON" > "$HOME/.config/gspread/service_account.json"
-          ls -al "$HOME/.config/gspread"
           python - <<'PY'
           import json, os
           p = os.path.expanduser("~/.config/gspread/service_account.json")
@@ -60,7 +65,7 @@ jobs:
           SHEET_ID: ${{ secrets.SHEET_ID }}
         run: |
           python - <<'PY'
-          import os, gspread
+          import os, gspread, datetime
           tab = "CI Health"
           gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
           sh = gc.open_by_key(os.environ["SHEET_ID"])
@@ -68,50 +73,20 @@ jobs:
               ws = sh.worksheet(tab)
           except Exception:
               ws = sh.add_worksheet(title=tab, rows=1000, cols=26)
-          ws.append_row(["CI smoke test (CNN-LSTM)", "ok"])
+          ws.append_row(["CI smoke test (CNN-LSTM)", datetime.datetime.utcnow().isoformat()+"Z"])
           print(f"Wrote a row to '{tab}'")
           PY
 
-      - name: Checkout data-cache branch
-        uses: actions/checkout@v4
-        with:
-          ref: data-cache
-          path: _data_cache_branch
-        continue-on-error: true
+      - name: Show train.py help (confirm flags)
+        run: python train.py --help || true
 
-      - name: Restore cached CSVs
-        run: |
-          set -euxo pipefail
-          if [ -d "_data_cache_branch" ]; then
-            mkdir -p data_cache
-            rsync -a --delete "_data_cache_branch"/ data_cache/ || true
-            echo "Restored $(ls -1 data_cache | wc -l) cached file(s)"
-          else
-            echo "No data-cache branch found yet (first run?)"
-          fi
-
-      - name: Prepare daily cache key
-        run: echo "CACHE_DATE=$(date -u +%Y-%m-%d)" >> $GITHUB_ENV
-
-      - name: Cache price data
-        uses: actions/cache@v4
-        with:
-          path: data_cache
-          key: stooq-yf-${{ env.CACHE_DATE }}
-          restore-keys: |
-            stooq-yf-
-
-      - name: Show train.py help (to confirm flags)
-        run: |
-          python train.py --help || true
-
-      - name: Train CNN-LSTM and write to its own tab
+      - name: Train CNN-LSTM from prices tab
         id: train
-        continue-on-error: true
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
           WORKSHEET_NAME: watchlist_cnnlstm
+          PRICES_TAB: prices
         run: |
           set -euxo pipefail
           LOG="$GITHUB_WORKSPACE/train_cnn_lstm.log"
@@ -121,11 +96,10 @@ jobs:
             --worksheet "$WORKSHEET_NAME" \
             --symbol-column "Ticker" \
             --use-prices-tab \
-            --prices-worksheet prices \
+            --prices-worksheet "$PRICES_TAB" \
             --period 10y \
             --interval 1d \
             2>&1 | tee "$LOG"
-
 
       - name: Upload training log
         if: always()
@@ -134,11 +108,31 @@ jobs:
           name: train-cnnlstm-log
           path: ${{ github.workspace }}/train_cnn_lstm.log
 
-      - name: Commit model artifacts (optional)
+      - name: Upload model artifacts
         if: steps.train.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnnlstm-model-${{ github.run_id }}
+          path: |
+            models/cnn_lstm_ALL.keras
+            models/scaler_ALL.pkl
+
+      - name: Commit model artifacts to main
+        if: steps.train.outcome == 'success'
+        env:
+          BRANCH: main
         run: |
-          git config user.name "github-actions[bot]"
+          set -euxo pipefail
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add models/cnn_lstm_ALL.keras models/scaler_ALL.pkl || true
-          git commit -m "Update CNN-LSTM weights ($(date -u +%F))" || echo "No changes"
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git fetch origin $BRANCH
+          git pull --rebase origin $BRANCH
+          git commit -m "Update CNN-LSTM weights ($(date -u +%F))"
+          git push --force-with-lease origin HEAD:$BRANCH
