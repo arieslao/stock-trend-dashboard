@@ -68,8 +68,13 @@ def period_to_days(period_str: str) -> int:
 def trim_period_daily(df: pd.DataFrame, period: str) -> pd.DataFrame:
     if df.empty or "Date" not in df.columns:
         return df
-    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=period_to_days(period))
-    return df[df["Date"] >= cutoff.tz_localize(None)]
+    d = df.copy()
+    # normalize any tz-aware dates to tz-NAIVE
+    d["Date"] = pd.to_datetime(d["Date"], errors="coerce", utc=True).dt.tz_localize(None)
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    cutoff = now.normalize() - pd.Timedelta(days=period_to_days(period))
+    return d[d["Date"] >= cutoff]
+
 
 # ------------ http session ------------
 def make_session():
@@ -168,35 +173,55 @@ def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
 
 # ------------ prices tab loader ------------
 def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
+    import pandas as pd
+
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(prices_tab)
     values = ws.get_all_values()
     if not values or len(values) < 2:
         raise SystemExit(f"'{prices_tab}' is empty.")
+
     header = [h.strip() for h in values[0]]
-    need = ["Date","Symbol","Close","Volume"]
+    need = ["Date", "Symbol", "Close", "Volume"]
     for c in need:
         if c not in header:
             raise SystemExit(f"'{prices_tab}' is missing column '{c}'")
+
     idx = {c: header.index(c) for c in need}
     rows = values[1:]
+
     df = pd.DataFrame(
         [[r[idx["Date"]], r[idx["Symbol"]], r[idx["Close"]], r[idx["Volume"]]]
          for r in rows if len(r) >= len(header)],
-        columns=["Date","Symbol","Close","Volume"]
+        columns=["Date", "Symbol", "Close", "Volume"]
     )
-    # filter tickers, types
-    symbols_up = {s.upper() for s in symbols}
-    df = df[df["Symbol"].str.upper().isin(symbols_up)].copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+
+    # types + make dates tz-NAIVE (strip any timezone)
+    df["Date"]   = pd.to_datetime(df["Date"], errors="coerce", utc=True).dt.tz_localize(None)
+    df["Close"]  = pd.to_numeric(df["Close"],  errors="coerce")
     df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-    df = df.dropna(subset=["Date","Close"])
-    # trim period
-    cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=period_to_days(period))
+    df = df.dropna(subset=["Date", "Close"])
+
+    # keep only requested symbols
+    symbols_up = {s.upper() for s in symbols}
+    df["Symbol"] = df["Symbol"].astype(str).str.upper()
+    df = df[df["Symbol"].isin(symbols_up)].copy()
+
+    # period cutoff (also tz-NAIVE)
+    def _days(p):
+        p = str(p).lower()
+        if p.endswith("y"):  return int(p[:-1]) * 365
+        if p.endswith("mo"): return int(p[:-2]) * 30
+        return 365
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    cutoff = (now.normalize() - pd.Timedelta(days=_days(period)))
+
     df = df[df["Date"] >= cutoff]
-    df = df.rename(columns={"Date":"time","Close":"close","Volume":"vol","Symbol":"symbol"})
-    return df.sort_values(["symbol","time"]).reset_index(drop=True)
+
+    # final columns for the pipeline
+    df = df.rename(columns={"Date": "time", "Close": "close", "Volume": "vol", "Symbol": "symbol"})
+    return df.sort_values(["symbol", "time"]).reset_index(drop=True)
+
 
 # ------------ features & model ------------
 def make_features(df):
