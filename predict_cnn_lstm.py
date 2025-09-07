@@ -1,12 +1,32 @@
 # predict_cnn_lstm.py — multi-horizon inference (predict CLOSE at H horizons)
 import os, json, argparse, datetime as dt
 from typing import List, Optional, Dict
+from parquet_input import load_prices_from_parquet
 
 import numpy as np
 import pandas as pd
 import gspread
 import joblib
 import tensorflow as tf
+
+
+# --- helpers to make feature frames robust ---
+def _dedupe_columns(df):
+    """Drop duplicate-named columns, keeping the first occurrence."""
+    return df.loc[:, ~df.columns.duplicated(keep='first')]
+
+def _ensure_close_raw(df):
+    """Guarantee a single numeric 'close_raw' column exists."""
+    if 'close_raw' not in df.columns:
+        if 'close' in df.columns:
+            df = df.copy()
+            df['close_raw'] = df['close']
+        else:
+            raise KeyError("Neither 'close_raw' nor 'close' present in features.")
+    # coerce to numeric
+    df['close_raw'] = pd.to_numeric(df['close_raw'], errors='coerce')
+    return df
+
 
 WINDOW = 60  # must match training
 
@@ -72,11 +92,16 @@ def make_features(df_prices: pd.DataFrame) -> pd.DataFrame:
     return df.dropna()
 
 def last_window_tensor(df_feat: pd.DataFrame, feats_order: List[str], window: int = WINDOW):
+    df_feat = _dedupe_columns(df_feat)
+    df_feat = _ensure_close_raw(df_feat)
+
     if len(df_feat) < window:
         return None, None
+
     X = df_feat.iloc[-window:][feats_order].values.astype(np.float32)
-    last_close_raw = float(df_feat.iloc[-1]["close_raw"])
+    last_close_raw = float(df_feat["close_raw"].iloc[-1])
     return X, last_close_raw
+
 
 def inverse_close_only(pred_scaled: np.ndarray, scaler, feats_order: List[str]) -> np.ndarray:
     """Inverse-scale using ONLY the 'close' component of the MinMax scaler."""
@@ -128,8 +153,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet-id", required=True)
     ap.add_argument("--worksheet", required=True, help="watchlist tab with a 'Ticker' column")
-    ap.add_argument("--symbol-column", default="Ticker")
-    ap.add_argument("--prices-worksheet", default="prices")
+    ap.add_argument("--symbol-column", default="Ticker")# Choose where to read price history from (one or the other)
+    src = ap.add_mutually_exclusive_group(required=False)
+    src.add_argument(
+        "--prices-worksheet",
+        default="prices",
+        help="Name of the 'prices' worksheet in the Google Sheet (default: prices)."
+    )
+    src.add_argument(
+        "--prices-parquet",
+        type=str,
+        default=None,
+        help="Path to a local Parquet file with columns [symbol,date,open,high,low,close,volume]. "
+             "If provided, this is used instead of the prices worksheet."
+    )
+
     ap.add_argument("--period", default="3y")
     ap.add_argument("--horizons", default="1,3,5,10,20")
     ap.add_argument("--model-path", default="models/cnn_lstm_ALL.keras")
@@ -157,11 +195,28 @@ def main():
         return
 
     # Prices & features
-    raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, args.period)
+    # (make sure you added: from parquet_input import load_prices_from_parquet at the top)
+    
+    # de-dupe & normalize watchlist just before use (optional but nice)
+    symbols = sorted({s.strip().upper() for s in symbols if s})
+    
+    if getattr(args, "prices_parquet", None):
+        # Use the curated local parquet (written earlier by export_prices_to_parquet.py)
+        raw = load_prices_from_parquet(args.prices_parquet, symbols, period=args.period)
+    else:
+        # Fall back to reading from the 'prices' worksheet
+        raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, args.period)
+    
     if raw.empty:
-        raise SystemExit("No rows in 'prices' for requested symbols/period")
-    raw["close_raw"] = raw["close"]
+        raise SystemExit("No rows in prices for the requested symbols/period")
+    
+    # Ensure close_raw exists and is numeric
+    if "close_raw" not in raw.columns:
+        raw["close_raw"] = raw["close"]
+    raw["close_raw"] = pd.to_numeric(raw["close_raw"], errors="coerce")
+    
     feat = make_features(raw)
+
 
     # Artifacts
     model = tf.keras.models.load_model(args.model_path)
