@@ -80,4 +80,87 @@ def _standardize_prices_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # Types & cleaning
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df["close"] = pd.to_numer_
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+
+    if "vol" in df.columns:
+        # Volume can be float in Sheets; coerce to int-ish (fill NaN with 0)
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0)
+        # Keep as int if all whole numbers, else leave as float
+        if (df["vol"].dropna() % 1 == 0).all():
+            df["vol"] = df["vol"].astype("int64")
+    else:
+        df["vol"] = 0
+
+    df = df.dropna(subset=["Date", "close"])
+    return df
+
+def read_prices_sheet(sheet_id, prices_worksheet, creds_path) -> pd.DataFrame:
+    gc = gspread.service_account(filename=creds_path)
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(prices_worksheet)
+
+    # Pull all rows with formulas evaluated so GOOGLEFINANCE values are realized
+    df = get_as_dataframe(
+        ws,
+        evaluate_formulas=True,
+        header=0,
+        numerize=True,              # attempt numeric conversion
+        dtype=None
+    )
+    # Remove fully-empty rows/cols that may trail the used range
+    df = df.dropna(how="all")
+    df = df.loc[:, ~df.columns.to_series().astype(str).str.fullmatch(r"\s*Unnamed: \d+\s*")]
+    return _standardize_prices_columns(df)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sheet-id", required=True)
+    ap.add_argument("--prices-worksheet", default="prices", help="Worksheet name containing GOOGLEFINANCE results")
+    ap.add_argument("--worksheets", required=True, help="Comma-separated list of watchlist worksheet names (used to filter symbols)")
+    ap.add_argument("--symbol-column", default="Ticker")
+    # Retained for compatibility; not used anymore (no external downloads).
+    ap.add_argument("--period", default="5y", help=argparse.SUPPRESS)
+    ap.add_argument("--interval", default="1d", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") \
+        or os.path.expanduser("~/.config/gspread/service_account.json")
+
+    # 1) Read symbols from watchlists (to decide which tickers to cache)
+    all_symbols = []
+    for tab in [w.strip() for w in args.worksheets.split(",") if w.strip()]:
+        syms = read_watchlist(args.sheet_id, tab, args.symbol_column, creds_path)
+        all_symbols.extend(syms)
+    wanted_symbols = list(dict.fromkeys(all_symbols))
+
+    # 2) Read tidy prices table from the Prices worksheet (GOOGLEFINANCE evaluated)
+    prices_df = read_prices_sheet(args.sheet_id, args.prices_worksheet, creds_path)
+
+    if wanted_symbols:
+        prices_df = prices_df[prices_df["symbol"].isin(set(wanted_symbols))]
+
+    if prices_df.empty:
+        print("No price rows found for requested symbols; nothing to update.")
+        sys.exit(0)
+
+    sample = sorted(prices_df["symbol"].unique())
+    print(f"Updating cache from Google Sheets '{args.prices_worksheet}' for {len(sample)} tickers: "
+          f"{sample[:10]}{'...' if len(sample) > 10 else ''}")
+
+    # 3) Write/merge per-symbol caches
+    total_updates = 0
+    for s in sorted(prices_df["symbol"].unique()):
+        sdf = (
+            prices_df.loc[prices_df["symbol"] == s, ["Date", "close", "vol", "symbol"]]
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+        added = merge_and_save(sdf, cache_path(s, source="gfinance"))
+        total_updates += max(0, added)
+        time.sleep(0.1)  # keep things polite
+
+    print(f"Cache update complete. Rows added across files: {total_updates}")
+
+if __name__ == "__main__":
+    main()
