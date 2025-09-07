@@ -62,6 +62,18 @@ jobs:
       - name: Show train.py help (confirm flags)
         run: python train.py --help || true
 
+      - name: Append missing prices to 'prices' sheet (idempotent)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          WORKSHEET_NAME: watchlist_cnnlstm
+          SYMBOL_COLUMN: Ticker
+          PRICES_TAB: prices
+        run: |
+          set -euxo pipefail
+          python append_prices.py
+
+
       - name: Train CNN-LSTM from prices tab
         id: train
         env:
