@@ -10,7 +10,7 @@ joblib==1.4.2
 oauth2client
 
 # Google Sheets
-pydrive2==1.20.0
+pydrive2==1.21.3
 duckdb==1.0.0
 gspread==6.1.2
 google-auth==2.33.0
