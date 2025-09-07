@@ -62,21 +62,7 @@ jobs:
       - name: Show train.py help (confirm flags)
         run: python train.py --help || true
 
-      # ---------- New: sync the Google Drive "data lake" to the runner ----------
-      - name: Sync Google Drive data lake to local folder
-        env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          LOCAL_LAKE_ROOT: ${{ github.workspace }}/data-lake
-        run: |
-          set -euxo pipefail
-          python sync_drive_to_local.py
-          echo "Synced to: $LOCAL_LAKE_ROOT"
-          # Optional quick peek (won't fail if big):
-          find "$LOCAL_LAKE_ROOT" -maxdepth 2 -type f | head -50 || true
-
-      # ---------- Keep your Sheets-based flow, but soft-fail append ----------
-      - name: Append missing prices to 'prices' sheet (idempotent; soft-fail if at cap)
-        continue-on-error: true
+      - name: Append missing prices to 'prices' sheet (idempotent)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -86,6 +72,19 @@ jobs:
         run: |
           set -euxo pipefail
           python append_prices.py
+
+      # === INSERTED STEP ===
+      - name: Export prices sheet to Parquet in Drive (optional)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PRICES_TAB: prices
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          LOCAL_LAKE_ROOT: ${{ github.workspace }}/data-lake
+        run: |
+          set -euxo pipefail
+          python export_prices_to_parquet.py
+      # === END INSERTED STEP ===
 
       - name: Train CNN-LSTM from prices tab
         id: train
@@ -164,7 +163,6 @@ jobs:
         with:
           name: train-cnnlstm-log
           path: ${{ github.workspace }}/train_cnn_lstm.log
-          if-no-files-found: ignore
 
       - name: Upload model artifacts
         if: steps.train.outcome == 'success'
