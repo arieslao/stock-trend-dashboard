@@ -1,0 +1,93 @@
+name: Evaluate & Calibrate (learn from past predictions)
+
+on:
+  schedule:
+    # Run shortly after US market close (20:10 UTC ≈ 4:10 pm ET; adjust if you like)
+    - cron: '10 20 * * 1-5'
+  workflow_dispatch: {}   # allow manual runs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evaluate-calibrate
+  cancel-in-progress: false
+
+jobs:
+  evaluate_and_calibrate:
+    runs-on: ubuntu-24.04
+
+    env:
+      # Sheets tabs — change if your tab names differ
+      PREDICTIONS_TAB: predictions
+      PRICES_TAB: prices
+      CALIBRATIONS_TAB: calibration
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Google service account JSON
+        env:
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+        run: |
+          set -euxo pipefail
+          echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
+          mkdir -p "$HOME/.config/gspread"
+          cp "$RUNNER_TEMP/sa.json" "$HOME/.config/gspread/service_account.json"
+          python - <<'PY'
+          import json, os
+          json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "sa.json")))
+          print("Service account JSON validated")
+          PY
+        shell: bash
+
+      - name: Configure Google credentials env var
+        run: echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
+
+      # 1) Score any past-due predictions using actuals from your prices tab
+      - name: Evaluate past-due predictions
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
+          PRICES_TAB: ${{ env.PRICES_TAB }}
+        run: |
+          set -euxo pipefail
+          python evaluate_predictions.py \
+            --sheet-id "$SHEET_ID" \
+            --predictions-worksheet "$PREDICTIONS_TAB" \
+            --prices-worksheet "$PRICES_TAB"
+
+      # 2) Refresh calibration from history so future predictions use updated bias fixes
+      - name: Update calibration from history
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
+          CALIBRATIONS_TAB: ${{ env.CALIBRATIONS_TAB }}
+        run: |
+          set -euxo pipefail
+          python calibrate_from_history.py \
+            --sheet-id "$SHEET_ID" \
+            --predictions-worksheet "$PREDICTIONS_TAB" \
+            --output-worksheet "$CALIBRATIONS_TAB"
+
+      - name: Upload logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluate-and-calibrate-logs
+          path: |
+            **/*.log
+          if-no-files-found: ignore
