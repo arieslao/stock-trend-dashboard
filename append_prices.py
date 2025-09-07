@@ -43,15 +43,12 @@ def get_watchlist(gc):
 
 def ensure_prices_ws(sh):
     try:
-        ws = sh.worksheet(PRICES_WS)
-        # ensure header exists / normalized
-        header = ws.row_values(1)
-        if header[:len(REQUIRED_COLS)] != REQUIRED_COLS:
-            ws.update([REQUIRED_COLS], range_name=f"{PRICES_WS}!A1")
-        return ws
+        return sh.worksheet(PRICES_WS)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(PRICES_WS, rows=2000, cols=len(REQUIRED_COLS))
-        ws.update([REQUIRED_COLS])  # header
+        # Create the worksheet
+        ws = sh.add_worksheet(title=PRICES_WS, rows=1000, cols=8)
+        # Write the header at A1 (DO NOT prefix the sheet name here)
+        ws.update('A1', [REQUIRED_COLS])
         return ws
 
 def read_prices(ws_prices):
