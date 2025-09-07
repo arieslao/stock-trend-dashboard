@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
+# Append missing daily rows to the PRICES_WS using GOOGLEFINANCE formulas only.
+# For each (Ticker, Date) not yet present, it appends one row:
+# Date | Ticker | =GOOGLEFINANCE(...,"open",Date) | ... | "price" | "volume"
+# Reads watchlist from WATCHLIST_WS. No external market APIs.
+
 import os, sys, datetime as dt
 import pandas as pd
 import gspread
 import gspread_dataframe as gd
-import yfinance as yf
 
 # Config via env (so it works nicely in Actions)
 SHEET_ID         = os.environ["SHEET_ID"]
 WATCHLIST_WS     = os.environ.get("WORKSHEET_NAME", "watchlist_cnnlstm")
 SYMBOL_COL       = os.environ.get("SYMBOL_COLUMN", "Ticker")
 PRICES_WS        = os.environ.get("PRICES_TAB", "prices")
-INTERVAL         = "1d"
 
 REQUIRED_COLS = ["Date","Ticker","Open","High","Low","Close","Volume"]
+LOOKBACK_YEARS = 15  # if a ticker has no history yet
 
 def auth():
     # Actions step already writes service_account.json to ~/.config/gspread
@@ -22,94 +26,136 @@ def get_watchlist(gc):
     sh = gc.open_by_key(SHEET_ID)
     ws = sh.worksheet(WATCHLIST_WS)
     df = gd.get_as_dataframe(ws, evaluate_formulas=False)
+    if SYMBOL_COL not in df.columns:
+        raise SystemExit(f"Column '{SYMBOL_COL}' not found in worksheet '{WATCHLIST_WS}'")
     tickers = (
         df[SYMBOL_COL]
         .dropna()
         .astype(str)
         .str.strip()
+        .str.upper()
         .unique()
         .tolist()
     )
+    # de-dup while preserving order
+    tickers = list(dict.fromkeys(tickers))
     return sh, tickers
 
 def ensure_prices_ws(sh):
     try:
-        return sh.worksheet(PRICES_WS)
+        ws = sh.worksheet(PRICES_WS)
+        # ensure header exists / normalized
+        header = ws.row_values(1)
+        if header[:len(REQUIRED_COLS)] != REQUIRED_COLS:
+            ws.update([REQUIRED_COLS], range_name=f"{PRICES_WS}!A1")
+        return ws
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(PRICES_WS, rows=1000, cols=8)
+        ws = sh.add_worksheet(PRICES_WS, rows=2000, cols=len(REQUIRED_COLS))
         ws.update([REQUIRED_COLS])  # header
         return ws
 
 def read_prices(ws_prices):
+    # We do NOT evaluate formulas here; we only need stored Date/Ticker
     df = gd.get_as_dataframe(ws_prices, evaluate_formulas=False, header=0, dtype={})
     if df.empty or df.columns.tolist()[:2] != ["Date","Ticker"]:
-        # normalize empty/misaligned sheets
         df = pd.DataFrame(columns=REQUIRED_COLS)
-    # keep only the required columns
+
+    # keep only required columns (create missing)
     for c in REQUIRED_COLS:
         if c not in df.columns:
             df[c] = pd.NA
-    df = df[REQUIRED_COLS].dropna(subset=["Date","Ticker"])
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
-    df["Ticker"] = df["Ticker"].astype(str).str.strip()
+    df = df[REQUIRED_COLS]
+
+    # Clean up types for Date + Ticker (Date is entered as a value, not a formula)
+    df = df.dropna(subset=["Date","Ticker"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
+    df = df.dropna(subset=["Date"])
+    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
     return df
 
-def fetch_missing_for(symbol, last_date):
-    start = None
-    if pd.notna(last_date):
-        start = (last_date + pd.Timedelta(days=1)).date()
-    # If no data yet, go back ~15y to be safe
-    if start is None:
-        start = (dt.date.today() - dt.timedelta(days=365*15))
-    df = yf.download(symbol, start=start, end=None, interval=INTERVAL, auto_adjust=False, progress=False)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=REQUIRED_COLS)
-    df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Adj Close":"Close","Volume":"Volume"})
-    df = df.reset_index().rename(columns={"Date":"Date"})
-    df["Ticker"] = symbol
-    out = df[["Date","Ticker","Open","High","Low","Close","Volume"]]
-    out["Date"] = pd.to_datetime(out["Date"]).dt.tz_localize(None)
-    return out
+def business_days(start_date: dt.date, end_date: dt.date):
+    if start_date > end_date:
+        return []
+    # Weekdays only (Mon-Fri). Holidays may yield blank formulas, which is OK.
+    rng = pd.bdate_range(start=start_date, end=end_date, freq="C")  # business days
+    return [d.date() for d in rng.to_pydatetime()]
+
+def gf_formula(symbol: str, attr: str, d: dt.date) -> str:
+    # Historical GOOGLEFINANCE returns a 2-column table (Date, Value) with a header row.
+    # INDEX(..., 2, 2) picks the first data row's value. IFERROR(...,"") hides N/A on holidays, etc.
+    y, m, a = d.year, d.month, d.day
+    # For "Close" we use attribute "price" (historical close)
+    return f'=IFERROR(INDEX(GOOGLEFINANCE("{symbol}","{attr}",DATE({y},{m},{a})),2,2),"")'
+
+def build_rows_for(symbol: str, dates: list[dt.date]):
+    rows = []
+    for d in dates:
+        rows.append([
+            d.strftime("%Y-%m-%d"),
+            symbol,
+            gf_formula(symbol, "open",   d),
+            gf_formula(symbol, "high",   d),
+            gf_formula(symbol, "low",    d),
+            gf_formula(symbol, "price",  d),  # Close
+            gf_formula(symbol, "volume", d),
+        ])
+    return rows
 
 def main():
     gc = auth()
     sh, tickers = get_watchlist(gc)
+    if not tickers:
+        print("No tickers found in watchlist; nothing to do.")
+        return
+
     ws_prices = ensure_prices_ws(sh)
     prices = read_prices(ws_prices)
 
-    last_by_ticker = prices.groupby("Ticker")["Date"].max() if not prices.empty else pd.Series(dtype="datetime64[ns]")
+    # Index existing (Ticker, Date) to avoid duplicates
+    existing_idx = set()
+    if not prices.empty:
+        existing_idx = set(zip(prices["Ticker"], prices["Date"].dt.date))
 
-    new_rows = []
+    # Last known date per ticker (if any)
+    last_by_ticker = (
+        prices.groupby("Ticker")["Date"].max().dt.date
+        if not prices.empty else pd.Series(dtype="object")
+    )
+
+    today = dt.date.today()
+    end_date = today - dt.timedelta(days=1)  # append only up to yesterday (EOD is final)
+
+    all_rows = []
     for t in tickers:
-        last = last_by_ticker.get(t, pd.NaT)
-        add = fetch_missing_for(t, last)
-        if not add.empty:
-            new_rows.append(add)
+        last = last_by_ticker.get(t, None)
+        if last is None or pd.isna(last):
+            start = today - dt.timedelta(days=LOOKBACK_YEARS * 365)
+        else:
+            start = last + dt.timedelta(days=1)
 
-    if not new_rows:
+        # Generate weekdays; skip if nothing to add
+        dates = business_days(start, end_date)
+        if not dates:
+            continue
+
+        # Extra safety: skip any (Ticker, Date) already present
+        dates = [d for d in dates if (t, d) not in existing_idx]
+        if not dates:
+            continue
+
+        all_rows.extend(build_rows_for(t, dates))
+
+    if not all_rows:
         print("No new rows to append.")
         return
 
-    add_all = pd.concat(new_rows, ignore_index=True).sort_values(["Date","Ticker"])
-    # de-dup defensive guard against any overlaps:
-    combined = pd.concat([prices, add_all], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["Ticker","Date"], keep="last")
-    # Only write the truly new part:
-    mask_new = ~combined.set_index(["Ticker","Date"]).index.isin(prices.set_index(["Ticker","Date"]).index)
-    to_write = combined.loc[mask_new, REQUIRED_COLS].sort_values(["Date","Ticker"])
+    # Append to the sheet, letting Sheets compute formulas
+    ws_prices.append_rows(all_rows, value_input_option="USER_ENTERED")
+    print(f"Appended {len(all_rows)} new rows to '{PRICES_WS}' using GOOGLEFINANCE formulas.")
 
-    if to_write.empty:
-        print("All fetched rows were already present. Nothing to append.")
-        return
-
-    # Append to the sheet without touching existing rows
-    values = [[d.strftime("%Y-%m-%d"), t, o, h, l, c, int(v) if pd.notna(v) else ""] 
-              for d,t,o,h,l,c,v in to_write.itertuples(index=False, name=None)]
-    ws_prices.append_rows(values, value_input_option="RAW")
-    print(f"Appended {len(values)} new rows to '{PRICES_WS}'.")
-    # Optional: print min/max date for sanity
-    if not combined.empty:
-        print("Now have data from", combined["Date"].min().date(), "to", combined["Date"].max().date())
+    # Sanity: report min/max of appended dates
+    appended_dates = sorted({r[0] for r in all_rows})
+    print(f"Appended date span: {appended_dates[0]} → {appended_dates[-1]}")
 
 if __name__ == "__main__":
     main()
