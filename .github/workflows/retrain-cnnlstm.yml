@@ -59,24 +59,6 @@ jobs:
           print("Service account JSON OK at:", p)
           PY
 
-      - name: Sanity write to Google Sheet (CI Health tab)
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-        run: |
-          python - <<'PY'
-          import os, gspread, datetime
-          tab = "CI Health"
-          gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-          sh = gc.open_by_key(os.environ["SHEET_ID"])
-          try:
-              ws = sh.worksheet(tab)
-          except Exception:
-              ws = sh.add_worksheet(title=tab, rows=1000, cols=26)
-          ws.append_row(["CI smoke test (CNN-LSTM)", datetime.datetime.utcnow().isoformat()+"Z"])
-          print(f"Wrote a row to '{tab}'")
-          PY
-
       - name: Show train.py help (confirm flags)
         run: python train.py --help || true
 
@@ -101,8 +83,7 @@ jobs:
             --interval 1d \
             2>&1 | tee "$LOG"
 
-      ### NEW: Predict → Evaluate → Calibrate ####################################
-
+      # -------- Predict → Evaluate → Calibrate --------
       - name: Generate predictions (direction + targets) to 'predictions'
         if: steps.train.outcome == 'success'
         env:
@@ -118,7 +99,7 @@ jobs:
             --worksheet "$WORKSHEET_NAME" \
             --symbol-column "Ticker" \
             --prices-worksheet "$PRICES_TAB" \
-            --period 10y \
+            --period 3y \
             --horizons 1,3,5,10,20 \
             --predictions-tab "$PREDICTIONS_TAB" \
             --apply-calibration
@@ -151,8 +132,6 @@ jobs:
             --lookback-days 60 \
             --min-samples 20
 
-      ###########################################################################
-
       - name: Upload training log
         if: always()
         uses: actions/upload-artifact@v4
@@ -169,30 +148,21 @@ jobs:
             models/cnn_lstm_ALL.keras
             models/scaler_ALL.pkl
 
-
       - name: Commit model artifacts to main
         if: steps.train.outcome == 'success'
         env:
           BRANCH: main
         run: |
           set -euxo pipefail
-      
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      
-          # Always base our commit on the latest remote main (avoids rebase/merge of binaries)
+          # Base our commit on latest remote main (avoids binary merge conflicts)
           git fetch origin $BRANCH
           git checkout -B $BRANCH origin/$BRANCH
-      
-          # Stage the updated model files
           git add -f models/cnn_lstm_ALL.keras models/scaler_ALL.pkl || true
-      
-          # If nothing changed, exit quietly
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-      
           git commit -m "Update CNN-LSTM weights ($(date -u +%F))"
           git push origin HEAD:$BRANCH
-      
