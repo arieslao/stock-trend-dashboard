@@ -18,7 +18,7 @@ gspread-dataframe
 tensorflow-cpu==2.15.0
 protobuf<4.25.0          # avoids known TF/Protobuf import clash
 h5py>=3.8                # Keras sometimes needs this for model I/O
-pandas-ta
+#pandas-ta
 
 # Timezone data for zoneinfo on some platforms
 tzdata>=2023.3
