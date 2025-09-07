@@ -1,9 +1,11 @@
-# fetch_prices.py — nightly cache updater
-# Reads watchlists from Google Sheets, downloads prices, and updates data_cache/*.csv
-import os, re, sys, io, time, argparse, requests
+# fetch_prices.py — nightly cache updater (Google Finance via Google Sheets)
+# Reads watchlists from Google Sheets, pulls computed GOOGLEFINANCE values from a "prices" worksheet,
+# and updates data_cache/*.csv (one cache per symbol). No external market APIs are called.
+
+import os, re, sys, time, argparse
 import pandas as pd
 import gspread
-import yfinance as yf
+from gspread_dataframe import get_as_dataframe
 
 CACHE_DIR = "data_cache"
 
@@ -17,58 +19,7 @@ def clean_tickers(raw):
             out.append(t)
     return list(dict.fromkeys(out))
 
-def to_stooq_symbol(t):
-    t = t.lower().replace(".", "-")
-    if not t.endswith(".us"):
-        t = f"{t}.us"
-    return t
-
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-    })
-    return s
-
-def fetch_stooq_csv(ticker, session):
-    sym = to_stooq_symbol(ticker)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    for i in range(3):
-        try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 200 and r.text.startswith("Date,Open,High,Low,Close,Volume"):
-                df = pd.read_csv(io.StringIO(r.text), parse_dates=["Date"])
-                df = df.rename(columns={"Close":"close","Volume":"vol"})
-                df["symbol"] = ticker
-                return df[["Date","close","vol","symbol"]]
-        except Exception:
-            pass
-        time.sleep(1+i)
-    return pd.DataFrame()
-
-def yf_download(ticker, period, interval, session):
-    last = None
-    for i in range(1, 4):
-        try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             auto_adjust=True, progress=False, threads=False, timeout=30, session=session)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                if "Date" not in df.columns and "Datetime" in df.columns:
-                    df = df.rename(columns={"Datetime":"Date"})
-                if {"Date","Close","Volume"}.issubset(df.columns):
-                    df = df.rename(columns={"Close":"close","Volume":"vol"})
-                    df["symbol"] = ticker
-                    return df[["Date","close","vol","symbol"]]
-            last = "empty dataframe"
-        except Exception as e:
-            last = e
-        time.sleep(2*i)
-    print(f"Warning: yfinance failed for {ticker}: {last}")
-    return pd.DataFrame()
-
-def cache_path(ticker, source):
+def cache_path(ticker, source="gfinance"):
     os.makedirs(CACHE_DIR, exist_ok=True)
     safe = ticker.replace("/", "_")
     return os.path.join(CACHE_DIR, f"{source}_{safe}.csv")
@@ -83,7 +34,7 @@ def merge_and_save(new_df, path):
         except Exception:
             old = pd.DataFrame()
     df = pd.concat([old, new_df], ignore_index=True)
-    df = df.drop_duplicates(subset=["Date", "symbol"]).sort_values(["symbol","Date"])
+    df = df.drop_duplicates(subset=["Date", "symbol"]).sort_values(["symbol", "Date"])
     df.to_csv(path, index=False)
     return len(df) - len(old)
 
@@ -99,44 +50,34 @@ def read_watchlist(sheet_id, worksheet, symbol_col, creds_path):
     symbols = [s for s in ws.col_values(idx)[1:] if s]
     return clean_tickers(symbols)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--sheet-id", required=True)
-    ap.add_argument("--worksheets", required=True, help="Comma-separated list of worksheet names")
-    ap.add_argument("--symbol-column", default="Ticker")
-    ap.add_argument("--period", default="5y")
-    ap.add_argument("--interval", default="1d")
-    args = ap.parse_args()
+def _standardize_prices_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize header names (flexible matching)
+    colmap = {}
+    for c in df.columns:
+        lc = str(c).strip().lower()
+        if lc in ("date", "datetime", "timestamp"):
+            colmap[c] = "Date"
+        elif lc in ("close", "adj close", "price", "closing price"):
+            colmap[c] = "close"
+        elif lc in ("volume", "vol"):
+            colmap[c] = "vol"
+        elif lc in ("symbol", "ticker"):
+            colmap[c] = "symbol"
 
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") \
-        or os.path.expanduser("~/.config/gspread/service_account.json")
+    required = {"Date", "close", "symbol"}
+    have = set(colmap.values())
+    if not required.issubset(have):
+        raise SystemExit(
+            f"Prices worksheet must include columns for Date, Close, and Symbol. "
+            f"Found (after mapping): {sorted(have)} from original {list(df.columns)}"
+        )
 
-    all_symbols = []
-    for tab in [w.strip() for w in args.worksheets.split(",") if w.strip()]:
-        syms = read_watchlist(args.sheet_id, tab, args.symbol_column, creds_path)
-        all_symbols.extend(syms)
-    symbols = list(dict.fromkeys(all_symbols))
-    print(f"Updating cache for {len(symbols)} tickers from: {symbols[:10]}{'...' if len(symbols)>10 else ''}")
+    cols = ["Date", "close", "symbol"]
+    if "vol" in have:
+        cols.append("vol")
 
-    session = make_session()
-    total_updates = 0
-    for s in symbols:
-        # Try Stooq first for daily
-        if args.interval == "1d":
-            stooq_df = fetch_stooq_csv(s, session)
-            if not stooq_df.empty:
-                added = merge_and_save(stooq_df, cache_path(s, "stooq"))
-                total_updates += max(0, added)
-                time.sleep(0.4)
-                continue
-        # Fallback to yfinance
-        yf_df = yf_download(s, args.period, args.interval, session)
-        if not yf_df.empty:
-            added = merge_and_save(yf_df, cache_path(s, "yfinance"))
-            total_updates += max(0, added)
-        time.sleep(0.4)
+    df = df.rename(columns=colmap)[cols].copy()
 
-    print(f"Cache update complete. Rows added across files: {total_updates}")
-
-if __name__ == "__main__":
-    main()
+    # Types & cleaning
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["close"] = pd.to_numer_
