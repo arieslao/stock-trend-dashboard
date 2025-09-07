@@ -1,237 +1,73 @@
-# train.py — nightly trainer for CNN-LSTM (multi-horizon)
-# Primary data: Stooq (free, stable). Fallback: yfinance with retries.
-# Reads tickers from Google Sheets. Includes EarlyStopping & CLI flags.
-# Supports reading historical data from a Google Sheet 'prices' tab
-# or downloading (Stooq primary, yfinance fallback) with a local cache.
+# train.py — train a multi-horizon CNN-LSTM that predicts future CLOSE at H horizons
+import os, argparse, json
+from typing import List, Optional, Tuple
 
-import os, re, sys, io, time, argparse, requests
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
 import joblib
 import gspread
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.linear_model import LinearRegression
 
-# ------------ constants ------------
 WINDOW = 60
-HORIZONS = [1, 3, 5, 10, 20]
-CACHE_DIR = "data_cache"
+FEATS_ORDER = ["close", "ret1", "ma10", "ma50", "vlog"]  # must match predict
 
-# ------------ CLI ------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Train stock models from Google Sheets watchlists.")
-    p.add_argument("--model", choices=["cnn-lstm", "linear"], default="cnn-lstm")
-    p.add_argument("--sheet-id", required=True)
-    p.add_argument("--worksheet", required=True)
-    p.add_argument("--symbol-column", default="Ticker")
-    p.add_argument("--period", default=os.getenv("PERIOD", "1y"))
-    p.add_argument("--interval", default=os.getenv("INTERVAL", "1d"))
-    # training controls
-    p.add_argument("--epochs", type=int, default=int(os.getenv("EPOCHS", 40)))
-    p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", 256)))
-    p.add_argument("--patience", type=int, default=int(os.getenv("PATIENCE", 5)))
-    # prices tab mode
-    p.add_argument("--use-prices-tab", action="store_true",
-                   help="Read from 'prices' worksheet instead of downloading")
-    p.add_argument("--prices-worksheet", default=os.getenv("PRICES_TAB", "prices"),
-                   help="Name of the prices worksheet")
-    return p.parse_args()
+def parse_horizons(s: str) -> List[int]:
+    return [int(x) for x in str(s).split(",") if str(x).strip()]
 
-# ------------ ticker helpers ------------
-def clean_tickers(raw):
-    out, seen = [], set()
-    for t in raw:
-        if not t: 
-            continue
-        t = str(t).strip().upper()
-        if not re.fullmatch(r"[\^A-Z0-9.\-=]{1,15}", t):
-            continue
-        if t not in seen:
-            out.append(t); seen.add(t)
-    return out
-
-def to_stooq_symbol(t):
-    t = t.lower().replace(".", "-")
-    if not t.endswith(".us"):
-        t += ".us"
-    return t
-
-# ------------ period helpers ------------
-def period_to_days(period_str: str) -> int:
-    ps = str(period_str).strip().lower()
-    if ps.endswith("y"):   return int(ps[:-1]) * 365
-    if ps.endswith("mo"):  return int(ps[:-2]) * 30
-    if ps in ("max", "all"): return 3650
-    return 365
-
-def trim_period_daily(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    if df.empty or "date" not in df.columns:
-        return df
-    d = df.copy()
-    d["date"] = pd.to_datetime(d["date"], errors="coerce", utc=True).dt.tz_localize(None)
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    cutoff = now.normalize() - pd.Timedelta(days=period_to_days(period))
-    return d[d["date"] >= cutoff]
-
-# ------------ http session ------------
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
-    return s
-
-# ------------ stooq/yf download + cache ------------
-def fetch_stooq_one(ticker: str, session: requests.Session) -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={to_stooq_symbol(ticker)}&i=d"
-    for i in range(3):
-        try:
-            r = session.get(url, timeout=20)
-            if r.status_code == 200 and r.text.startswith("Date,Open,High,Low,Close,Volume"):
-                df = pd.read_csv(io.StringIO(r.text))
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-                df = df.dropna(subset=["Date"])
-                # normalize to lower-case
-                df = df.rename(columns={"Date":"date","Close": "close", "Volume": "vol"})
-                df["symbol"] = ticker
-                return df[["date","close","vol","symbol"]]
-        except Exception:
-            pass
-        time.sleep(1+i)
-    return pd.DataFrame()
-
-def yf_download(ticker, period, interval, session, tries=4, backoff=3) -> pd.DataFrame:
-    last = None
-    for i in range(1, tries+1):
-        try:
-            df = yf.download(ticker, period=period, interval=interval,
-                             auto_adjust=True, progress=False, threads=False,
-                             timeout=30, session=session)
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                if "Date" not in df.columns and "Datetime" in df.columns:
-                    df = df.rename(columns={"Datetime":"Date"})
-                if {"Date","Close","Volume"}.issubset(df.columns):
-                    df = df.rename(columns={"Date":"date","Close":"close","Volume":"vol"})
-                    df["symbol"] = ticker
-                    return df[["date","close","vol","symbol"]]
-            last = "empty"
-        except Exception as e:
-            last = e
-        time.sleep(backoff*i)
-    print(f"Warning: yfinance failed for '{ticker}': {last}")
-    return pd.DataFrame()
-
-def cache_path(ticker: str, source: str) -> str:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{source}_{ticker.replace('/','_')}.csv")
-
-def load_cache(path: str) -> pd.DataFrame:
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path)
-            # normalize cached to lower-case
-            df.columns = [c.strip().lower() for c in df.columns]
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            return df
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
-
-def save_cache(df: pd.DataFrame, path: str) -> None:
-    try:
-        df.to_csv(path, index=False)
-    except Exception:
-        pass
-
-def get_history(symbols=("AAPL",), period="1y", interval="1d") -> pd.DataFrame:
-    """Primary: Stooq (daily). Fallback: yfinance. Uses local CSV cache too."""
-    session = make_session()
-    frames = []
-    for s in symbols:
-        df = pd.DataFrame()
-        if interval == "1d":
-            cpath = cache_path(s, "stooq")
-            df = load_cache(cpath)
-            if df.empty:
-                df = fetch_stooq_one(s, session)
-                if not df.empty: save_cache(df, cpath)
-            if not df.empty:
-                df = trim_period_daily(df, period)
-                frames.append(df.rename(columns={"date":"time"}))
-                time.sleep(0.4)
-                continue
-        # fallback to yahoo
-        cpath = cache_path(s, "yfinance")
-        yfd = load_cache(cpath)
-        if yfd.empty:
-            yfd = yf_download(s, period=period, interval=interval, session=session)
-            if not yfd.empty: save_cache(yfd, cpath)
-        if not yfd.empty:
-            frames.append(yfd.rename(columns={"date":"time"}))
-        time.sleep(0.4)
-
-    if not frames:
-        print("Error: No data could be fetched for any symbols.")
-        sys.exit(1)
-    return pd.concat(frames, ignore_index=True)
-
-# ------------ prices tab loader (case-insensitive) ------------
-def load_prices_from_sheet(gc, sheet_id, prices_tab, symbols, period="1y"):
+def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
+                           symbols: Optional[List[str]], period: str) -> pd.DataFrame:
     sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(prices_tab)
-    values = ws.get_all_values()
-    if not values or len(values) < 2:
-        raise SystemExit(f"'{prices_tab}' is empty.")
+    ws = sh.worksheet(prices_worksheet)
+    vals = ws.get_all_values()
+    if not vals or len(vals) < 2:
+        raise RuntimeError(f"'{prices_worksheet}' is empty or missing headers")
 
-    # build df then normalize to lower-case
-    df = pd.DataFrame(values[1:], columns=[h.strip() for h in values[0]])
+    df = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # map common variants
+    # normalize common variants
+    rename = {}
     if "adj close" in df.columns and "close" not in df.columns:
-        df = df.rename(columns={"adj close":"close"})
+        rename["adj close"] = "close"
     if "adj_close" in df.columns and "close" not in df.columns:
-        df = df.rename(columns={"adj_close":"close"})
+        rename["adj_close"] = "close"
     if "volume" in df.columns and "vol" not in df.columns:
-        df = df.rename(columns={"volume":"vol"})
+        rename["volume"] = "vol"
+    if rename:
+        df = df.rename(columns=rename)
 
-    required = {"date","symbol","close"}
-    missing = required - set(df.columns)
-    if missing:
-        raise SystemExit(f"'{prices_tab}' is missing required column(s): {missing}")
+    need = {"date", "symbol", "close"}
+    miss = need - set(df.columns)
+    if miss:
+        raise RuntimeError(f"'{prices_worksheet}' missing required columns: {miss}. Found: {list(df.columns)}")
 
-    # types
-    df["date"]  = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_localize(None)
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_localize(None)
+    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     if "vol" in df.columns:
-        df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0)
-    else:
-        df["vol"] = 0.0  # keep pipeline stable
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
 
-    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-    df = df.dropna(subset=["date","close"])
+    # optional time filter (like "10y", "3y", "6m", "90d")
+    per = (period or "").strip().lower()
+    if per and per != "max":
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        cutoff = None
+        if per.endswith("y"):
+            cutoff = now - pd.DateOffset(years=int(per[:-1] or "1"))
+        elif per.endswith("m"):
+            cutoff = now - pd.DateOffset(months=int(per[:-1] or "1"))
+        elif per.endswith("d"):
+            cutoff = now - pd.Timedelta(days=int(per[:-1] or "1"))
+        if cutoff is not None:
+            df = df[df["date"] >= cutoff]
 
-    # filter to requested symbols
-    symbols_up = {s.upper() for s in symbols}
-    df = df[df["symbol"].isin(symbols_up)].copy()
+    cols = ["date", "symbol", "close"] + (["vol"] if "vol" in df.columns else [])
+    return df[cols].sort_values(["symbol", "date"]).reset_index(drop=True)
 
-    # period cutoff
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    cutoff = now.normalize() - pd.Timedelta(days=period_to_days(period))
-    df = df[df["date"] >= cutoff]
-
-    # final columns for the pipeline
-    df = df.rename(columns={"date":"time"})
-    return df.sort_values(["symbol","time"]).reset_index(drop=True)
-
-# ------------ features & model ------------
-def make_features(df):
-    df = df.copy()
+def make_features(df_prices: pd.DataFrame) -> pd.DataFrame:
+    df = df_prices.copy()
     if "vol" not in df.columns:
         df["vol"] = 0.0
     df["ret1"] = df.groupby("symbol")["close"].pct_change()
@@ -240,120 +76,168 @@ def make_features(df):
     df["vlog"] = np.log1p(df["vol"])
     return df.dropna()
 
-def windowize(df, window=WINDOW, horizons=HORIZONS):
-    feats = ["close", "ret1", "ma10", "ma50", "vlog"]
-    scaler = MinMaxScaler()
-    df = df.copy()
-    df[feats] = scaler.fit_transform(df[feats].values)
-    Xs, Ys = [], []
-    for s, g in df.groupby("symbol"):
-        g = g.reset_index(drop=True)
-        if len(g) <= window + max(horizons):
-            print(f"Warning: Not enough data for '{s}' to create windows. Skipping.")
-            continue
-        for i in range(len(g) - window - max(horizons)):
-            x = g.loc[i:i+window-1, feats].values
-            future = [g.loc[i+window-1+h, "close"] for h in horizons]
-            Xs.append(x); Ys.append(future)
-    if not Xs:
-        print("Error: Could not create any training windows from the provided data.")
-        sys.exit(1)
-    X = np.array(Xs); y = np.array(Ys, dtype=np.float32)
-    return X, y, scaler, feats
+def build_windows_multihorizon(
+    feat_scaled: pd.DataFrame,
+    raw_feat: pd.DataFrame,
+    horizons: List[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Inputs:
+      - feat_scaled: features already scaled on FEATS_ORDER
+      - raw_feat: same rows as feat_scaled (unscaled), used to read future CLOSE for targets
+    Returns:
+      X: (N, WINDOW, n_feats), y: (N, H) where H=len(horizons) and each y is CLOSE at +h days (scaled using close-scaler)
+    """
+    H = len(horizons)
+    X_list, y_list = [], []
+    max_h = max(horizons)
+    # we assume feat_scaled and raw_feat are aligned (same index) per symbol
+    for sym, g_sc in feat_scaled.groupby("symbol", sort=False):
+        g_raw = raw_feat[raw_feat["symbol"] == sym]
+        g_sc = g_sc.reset_index(drop=True)
+        g_raw = g_raw.reset_index(drop=True)
 
-def build_model(n_features, window=WINDOW, n_out=len(HORIZONS)):
-    inp = tf.keras.Input(shape=(window, n_features))
-    x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(inp)
-    x = tf.keras.layers.Conv1D(32, 3, padding="causal", activation="relu")(x)
-    x = tf.keras.layers.LSTM(64)(x)
-    x = tf.keras.layers.Dropout(0.2)(x)
-    out = tf.keras.layers.Dense(n_out)(x)
+        if len(g_sc) < WINDOW + max_h:
+            continue
+
+        # for each end index t (inclusive) that allows all horizons
+        for t in range(WINDOW - 1, len(g_sc) - max_h):
+            X = g_sc.loc[t - WINDOW + 1 : t, FEATS_ORDER].values.astype(np.float32)
+            fut_idx = [t + h for h in horizons]
+            closes_future = g_raw.loc[fut_idx, "close"].values.astype(np.float32)
+            X_list.append(X)
+            y_list.append(closes_future)
+
+    if not X_list:
+        return np.zeros((0, WINDOW, len(FEATS_ORDER)), dtype=np.float32), np.zeros((0, len(horizons)), dtype=np.float32)
+
+    X = np.stack(X_list, axis=0)
+    y_close = np.stack(y_list, axis=0)  # real CLOSE, not scaled (yet) — we’ll scale with the close scaler below
+    return X, y_close
+
+def scale_targets_close_only(y_close: np.ndarray, scaler: MinMaxScaler, feats_order: List[str]) -> np.ndarray:
+    """Scale CLOSE targets with the scaler's 'close' params."""
+    close_idx = feats_order.index("close")
+    dmin = scaler.data_min_[close_idx]
+    drng = scaler.data_range_[close_idx]
+    return (y_close - dmin) / drng
+
+def make_model(n_feats: int, H: int) -> tf.keras.Model:
+    inp = tf.keras.layers.Input(shape=(WINDOW, n_feats))
+    x = tf.keras.layers.Conv1D(32, 3, activation="relu")(inp)
+    x = tf.keras.layers.Conv1D(32, 3, activation="relu")(x)
+    x = tf.keras.layers.MaxPooling1D()(x)
+    x = tf.keras.layers.LSTM(64, return_sequences=False)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    out = tf.keras.layers.Dense(H, activation="linear")(x)  # outputs scaled CLOSE at H horizons
     model = tf.keras.Model(inp, out)
-    model.compile(optimizer="adam", loss=tf.keras.losses.Huber(), metrics=["mae"])
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse", metrics=["mae"])
     return model
 
-# ------------ main ------------
 def main():
-    args = parse_args()
+    ap = argparse.ArgumentParser(description="Train stock models from Google Sheets watchlists.")
+    ap.add_argument("--model", default="cnn-lstm", help="cnn-lstm, linear")
+    ap.add_argument("--sheet-id", required=True)
+    ap.add_argument("--worksheet", required=True)
+    ap.add_argument("--symbol-column", default="Ticker")
+    ap.add_argument("--period", default="10y")
+    ap.add_argument("--interval", default="1d")  # kept for compatibility; unused when reading prices sheet
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--batch-size", type=int, default=256)
+    ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--use-prices-tab", action="store_true", help="Read from 'prices' worksheet instead of downloading")
+    ap.add_argument("--prices-worksheet", default="prices", help="Name of the prices worksheet")
+    ap.add_argument("--horizons", default="1,3,5,10,20")
+    ap.add_argument("--model-path", default="models/cnn_lstm_ALL.keras")
+    ap.add_argument("--scaler-path", default="models/scaler_ALL.pkl")
+    args = ap.parse_args()
+
+    horizons = parse_horizons(args.horizons)
+    H = len(horizons)
+    assert H >= 1, "At least one horizon required"
+
     print(
         f"Args: model={args.model}, sheet-id={args.sheet_id}, worksheet={args.worksheet}, "
         f"symbol-column={args.symbol_column}, period={args.period}, interval={args.interval}, "
         f"epochs={args.epochs}, batch={args.batch_size}, patience={args.patience}, "
-        f"use_prices_tab={args.use_prices_tab}, prices_ws={args.prices_worksheet}"
+        f"use_prices_tab={args.use_prices_tab}, prices_ws={args.prices_worksheet}, horizons={horizons}"
     )
 
-    # Sheets auth
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") \
-        or os.path.expanduser("~/.config/gspread/service_account.json")
+    # ---- Watchlist ----
     print("Authenticating with Google Sheets...")
-    gc = gspread.service_account(filename=creds_path)
+    gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
     sh = gc.open_by_key(args.sheet_id)
-    ws = sh.worksheet(args.worksheet)
-
-    # Read tickers (case-insensitive header)
-    header_row = [h.strip() for h in ws.row_values(1)]
+    wl = sh.worksheet(args.worksheet)
+    hdr = [h.strip() for h in wl.row_values(1)]
     try:
-        col_index = [h.lower() for h in header_row].index(args.symbol_column.lower()) + 1
+        cidx = [h.lower() for h in hdr].index(args.symbol_column.lower()) + 1
     except ValueError:
-        print(f"Error: Column '{args.symbol_column}' not found in worksheet '{args.worksheet}'.")
-        sys.exit(1)
-    symbols = clean_tickers(ws.col_values(col_index)[1:])
-    if not symbols:
-        print("Error: No valid tickers found in watchlist.")
-        sys.exit(1)
+        raise SystemExit(f"Column '{args.symbol_column}' not found in watchlist '{args.worksheet}'")
+    symbols = [s.strip().upper() for s in wl.col_values(cidx)[1:] if s.strip()]
     print(f"Using tickers: {symbols}")
 
-    # Load prices
-    if args.use_prices_tab:
-        print(f"Loading data from prices tab '{args.prices_worksheet}'...")
-        raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, period=args.period)
-    else:
-        raw = get_history(symbols, period=args.period, interval=args.interval)
-        # get_history returns lower-case date -> 'time'
-        raw = raw.rename(columns={"date":"time"}) if "date" in raw.columns else raw
+    # ---- Prices & features ----
+    if not args.use_prices_tab:
+        raise SystemExit("This training script expects --use-prices-tab; prices download not wired here.")
+    print(f"Loading data from prices tab '{args.prices_worksheet}'...")
+    raw = load_prices_from_sheet(gc, args.sheet_id, args.prices_worksheet, symbols, args.period)
+    if raw.empty:
+        raise SystemExit("No rows in 'prices' for requested symbols/period")
+    feat_raw = make_features(raw)
 
-    raw = raw.sort_values(["symbol","time"]).reset_index(drop=True)
+    # fit scaler on FEATS_ORDER columns over entire dataset
+    scaler = MinMaxScaler()
+    feat_scaled = feat_raw.copy()
+    feat_scaled[FEATS_ORDER] = scaler.fit_transform(feat_raw[FEATS_ORDER].values)
 
-    # Features
-    feat = make_features(raw)
+    # build multi-horizon windows
+    X, y_close = build_windows_multihorizon(feat_scaled, feat_raw, horizons)
+    y = scale_targets_close_only(y_close, scaler, FEATS_ORDER)
 
-    # Linear branch
-    if args.model == "linear":
-        df = feat.dropna(subset=["ma10","ma50"])
-        if df.empty:
-            print("Error: Not enough data to train linear model.")
-            sys.exit(1)
-        X = df[["ma10","ma50"]].values
-        y = df["close"].values
-        model = LinearRegression().fit(X, y)
-        os.makedirs("models", exist_ok=True)
-        joblib.dump(model, "models/linear_model.pkl")
-        print("✅ Saved models/linear_model.pkl")
-        return
-
-    # CNN-LSTM branch
-    X, y, scaler, feats = windowize(feat)
     print(f"Created training dataset with shape X: {X.shape}, y: {y.shape}")
 
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience, restore_best_weights=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=max(1, args.patience//2), min_lr=1e-5),
+    if X.shape[0] == 0:
+        raise SystemExit("No training samples (not enough history per symbol for given WINDOW/horizons).")
+
+    # ---- Model ----
+    if args.model == "cnn-lstm":
+        model = make_model(n_feats=len(FEATS_ORDER), H=y.shape[1])
+    elif args.model == "linear":
+        # baseline linear head
+        inp = tf.keras.layers.Input(shape=(WINDOW, len(FEATS_ORDER)))
+        x = tf.keras.layers.Flatten()(inp)
+        out = tf.keras.layers.Dense(y.shape[1], activation="linear")(x)
+        model = tf.keras.Model(inp, out)
+        model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse", metrics=["mae"])
+    else:
+        raise SystemExit(f"Unknown --model '{args.model}'")
+
+    cbs = [
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, verbose=1),
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience, restore_best_weights=True, verbose=1),
     ]
-    model = build_model(n_features=X.shape[-1])
+
     model.fit(
         X, y,
         epochs=args.epochs,
         batch_size=args.batch_size,
         validation_split=0.1,
-        callbacks=callbacks,
+        shuffle=True,
         verbose=2,
+        callbacks=cbs,
     )
 
-    # Save artifacts
-    os.makedirs("models", exist_ok=True)
-    model.save("models/cnn_lstm_ALL.keras")
-    joblib.dump({"scaler": scaler, "feats": feats}, "models/scaler_ALL.pkl")
-    print("✅ Saved models/cnn_lstm_ALL.keras and models/scaler_ALL.pkl")
+    # ---- Save artifacts ----
+    os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+    model.save(args.model_path)
+
+    os.makedirs(os.path.dirname(args.scaler_path), exist_ok=True)
+    joblib.dump(
+        {"scaler": scaler, "feats": FEATS_ORDER, "horizons": horizons},
+        args.scaler_path
+    )
+
+    print(f"✅ Saved {args.model_path} and {args.scaler_path}")
 
 if __name__ == "__main__":
     main()
