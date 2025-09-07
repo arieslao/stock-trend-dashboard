@@ -1,4 +1,4 @@
-# predict_cnn_lstm.py — load the trained CNN-LSTM and write predictions to Google Sheets
+# predict_cnn_lstm.py — multi-horizon inference (predict CLOSE at H horizons)
 import os, json, argparse, datetime as dt
 from typing import List, Optional, Dict
 
@@ -10,13 +10,8 @@ import tensorflow as tf
 
 WINDOW = 60  # must match training
 
-def load_prices_from_sheet(
-    gc,
-    sheet_id: str,
-    prices_worksheet: str,
-    symbols: Optional[List[str]],
-    period: str,
-) -> pd.DataFrame:
+def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
+                           symbols: Optional[List[str]], period: str) -> pd.DataFrame:
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(prices_worksheet)
     vals = ws.get_all_values()
@@ -26,16 +21,16 @@ def load_prices_from_sheet(
     df = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # common variants → expected names
-    ren = {}
+    # normalize common variants
+    rename_map = {}
     if "adj close" in df.columns and "close" not in df.columns:
-        ren["adj close"] = "close"
+        rename_map["adj close"] = "close"
     if "adj_close" in df.columns and "close" not in df.columns:
-        ren["adj_close"] = "close"
+        rename_map["adj_close"] = "close"
     if "volume" in df.columns and "vol" not in df.columns:
-        ren["volume"] = "vol"
-    if ren:
-        df = df.rename(columns=ren)
+        rename_map["volume"] = "vol"
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
     required = {"date", "symbol", "close"}
     missing = required - set(df.columns)
@@ -49,10 +44,7 @@ def load_prices_from_sheet(
         df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
     df = df.dropna(subset=["date", "close"])
 
-    if symbols:
-        want = {s.strip().upper() for s in symbols if s and str(s).strip()}
-        df = df[df["symbol"].isin(want)]
-
+    # optional time filter (like "3y", "6m", "90d")
     per = (period or "").strip().lower()
     if per and per != "max":
         now = pd.Timestamp.utcnow().tz_localize(None)
@@ -72,7 +64,7 @@ def load_prices_from_sheet(
 def make_features(df_prices: pd.DataFrame) -> pd.DataFrame:
     df = df_prices.copy()
     if "vol" not in df.columns:
-        df["vol"] = 0.0  # keep pipeline stable when Volume is absent
+        df["vol"] = 0.0
     df["ret1"] = df.groupby("symbol")["close"].pct_change()
     df["ma10"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(10).mean())
     df["ma50"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(50).mean())
@@ -87,6 +79,7 @@ def last_window_tensor(df_feat: pd.DataFrame, feats_order: List[str], window: in
     return X, last_close_raw
 
 def inverse_close_only(pred_scaled: np.ndarray, scaler, feats_order: List[str]) -> np.ndarray:
+    """Inverse-scale using ONLY the 'close' component of the MinMax scaler."""
     close_idx = feats_order.index("close")
     data_min = scaler.data_min_[close_idx]
     data_rng = scaler.data_range_[close_idx]
@@ -114,7 +107,7 @@ def read_calibration(gc, sheet_id: str, tab: str) -> Dict[str, float]:
             if sym:
                 out[sym] = bias
         except Exception:
-            pass
+            continue
     return out
 
 def sheet_append_rows(gc, sheet_id: str, tab: str, rows: List[List]):
@@ -122,14 +115,14 @@ def sheet_append_rows(gc, sheet_id: str, tab: str, rows: List[List]):
     try:
         ws = sh.worksheet(tab)
     except Exception:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=26)
-        ws.append_row([
-            "timestamp_utc","symbol","horizon","last_close","predicted",
-            "pct_change","signal","scope","model_kind","params_json",
-            "train_window","features","actual"
-        ])
+        ws = sh.add_worksheet(title=tab, rows=2000, cols=26)
+        ws.append_row(
+            ["timestamp_utc", "symbol", "horizon", "last_close", "predicted",
+             "pct_change", "signal", "scope", "model_kind", "params_json",
+             "train_window", "features", "actual"]
+        )
     for i in range(0, len(rows), 1000):
-        ws.append_rows(rows[i:i+1000], value_input_option="USER_ENTERED")
+        ws.append_rows(rows[i:i + 1000], value_input_option="USER_ENTERED")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -148,10 +141,9 @@ def main():
     args = ap.parse_args()
 
     horizons = [int(x) for x in str(args.horizons).split(",") if str(x).strip()]
-
     gc = gspread.service_account(filename=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
 
-    # Watchlist symbols (case-insensitive header)
+    # Watchlist symbols
     sh = gc.open_by_key(args.sheet_id)
     wl = sh.worksheet(args.worksheet)
     hdr = [h.strip() for h in wl.row_values(1)]
@@ -176,37 +168,29 @@ def main():
     scalerd = joblib.load(args.scaler_path)
     scaler, feats_order = scalerd["scaler"], scalerd["feats"]
 
-    # Scale features
+    # Scale inputs
     feat_scaled = feat.copy()
     feat_scaled[feats_order] = scaler.transform(feat_scaled[feats_order].values)
 
-    # Optional calibration
+    # Optional per-symbol calibration (single bias applied to all horizons)
     calib = read_calibration(gc, args.sheet_id, args.calibration_worksheet) if args.apply_calibration else {}
 
-    # Logging bucket for skipped symbols
     skipped = []
-
-    # Predict per symbol
     out_rows: List[List] = []
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    for sym, g_scaled in feat_scaled.groupby("symbol"):
+    # Predict per symbol
+    for sym, g_scaled in feat_scaled.groupby("symbol", sort=False):
         g_raw = feat[feat["symbol"] == sym].copy()
 
-        if g_raw.empty:
-            skipped.append((sym, "no feature rows"))
-            continue
-        if len(g_raw) < WINDOW:
-            skipped.append((sym, f"raw_len={len(g_raw)} < WINDOW"))
-            continue
-        if len(g_scaled) < WINDOW:
-            skipped.append((sym, f"scaled_len={len(g_scaled)} < WINDOW"))
+        if g_raw.empty or len(g_raw) < WINDOW or len(g_scaled) < WINDOW:
+            skipped.append((sym, f"len<{WINDOW} after features"))
             continue
 
         try:
             g_raw["close_raw"] = raw.loc[raw["symbol"] == sym, "close"].values[-len(g_raw):]
         except Exception:
-            skipped.append((sym, "close_raw align fail"))
+            skipped.append((sym, "could not align close_raw"))
             continue
 
         X, last_close = last_window_tensor(
@@ -218,29 +202,32 @@ def main():
             WINDOW
         )
         if X is None:
-            skipped.append((sym, "last_window_tensor -> None"))
+            skipped.append((sym, "last_window_tensor=None"))
             continue
 
-        y_scaled = model.predict(X[None, ...], verbose=0)[0]
-        preds = inverse_close_only(np.array(y_scaled), scaler, feats_order)
+        y_scaled = model.predict(X[None, ...], verbose=0).reshape(-1)  # length H
+        if y_scaled.size == 0:
+            skipped.append((sym, "model_output_len=0"))
+            continue
 
+        preds_close = inverse_close_only(y_scaled, scaler, feats_order)  # array length H (unbiased)
         bias_pct = float(calib.get(sym, 0.0))
-        adj_factor = 1.0 + bias_pct / 100.0
+        adj_factor = (1.0 + bias_pct / 100.0)
+        preds_adj = preds_close * adj_factor
 
-        for h, p in zip(horizons, preds[:len(horizons)]):
-            p_adj = float(p) * adj_factor
+        for h, p_adj in zip(horizons, preds_adj[: len(horizons)]):
             pct = float((p_adj - last_close) / last_close * 100.0)
             signal = 1 if p_adj > last_close else (-1 if p_adj < last_close else 0)
             params = {"horizons": horizons}
             if args.apply_calibration:
                 params["bias_pct"] = bias_pct
             out_rows.append([
-                now_iso, sym, h, round(last_close, 6), round(p_adj, 6),
-                round(pct, 4), signal, args.scope, "CNN-LSTM",
+                now_iso, sym, h, round(last_close, 6), round(float(p_adj), 6),
+                round(pct, 4), signal, args.scope, "CNN-LSTM(multiH)",
                 json.dumps(params), WINDOW, ",".join(feats_order), ""
             ])
 
-    # Helpful summary for Actions logs
+    # Helpful summary
     try:
         uniq_in_prices = int(raw["symbol"].nunique())
     except Exception:
