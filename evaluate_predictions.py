@@ -23,7 +23,7 @@ def nearest_close_on_or_after(pdf, sym, target_date):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet-id", required=True)
-    ap.add_argument("--predictions-worksheet", default="predictions")
+    ap.add_argument("---worksheet", default="")
     ap.add_argument("--prices-worksheet", default="prices")
     args = ap.parse_args()
 
@@ -60,6 +60,24 @@ def main():
     prices = prices.dropna(subset=["date","close"]).sort_values(["symbol","date"])
     pdf = prices
 
+    # predictions (create if missing; handle empty gracefully)
+    try:
+        wpred = sh.worksheet(args.predictions_worksheet)
+    except gspread.exceptions.WorksheetNotFound:
+        wpred = sh.add_worksheet(title=args.predictions_worksheet, rows=2000, cols=20)
+        wpred.update('A1', [[
+            "timestamp_utc","symbol","horizon","last_close","predicted",
+            "pct_change","signal","scope","model_kind","params_json",
+            "train_window","features","actual"
+        ]])
+        print(f"Created '{args.predictions_worksheet}' and found nothing to evaluate today.")
+        return
+    
+    vals = wpred.get_all_values()
+    if not vals:
+        print(f"'{args.predictions_worksheet}' has no header/rows; nothing to evaluate.")
+        return
+    
     # ---- predictions (case-insensitive) ----
     wpred = sh.worksheet(args.predictions_worksheet)
     vals  = wpred.get_all_values()
