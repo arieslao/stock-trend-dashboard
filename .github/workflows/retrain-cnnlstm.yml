@@ -81,6 +81,7 @@ jobs:
             --prices-worksheet "$PRICES_TAB" \
             --period 10y \
             --interval 1d \
+            --horizons "1,3,5,10,20"\
             2>&1 | tee "$LOG"
 
       # -------- Predict → Evaluate → Calibrate --------
