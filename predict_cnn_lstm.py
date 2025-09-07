@@ -10,16 +10,13 @@ import tensorflow as tf
 
 WINDOW = 60  # must match training
 
-def period_to_days(p: str) -> int:
-    p = str(p).strip().lower()
-    if p.endswith("y"):   return int(p[:-1]) * 365
-    if p.endswith("mo"):  return int(p[:-2]) * 30
-    if p.endswith("m"):   return int(p[:-1]) * 30
-    if p.endswith("d"):   return int(p[:-1])
-    return 365
-
-def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
-                           symbols: Optional[List[str]], period: str) -> pd.DataFrame:
+def load_prices_from_sheet(
+    gc,
+    sheet_id: str,
+    prices_worksheet: str,
+    symbols: Optional[List[str]],
+    period: str,
+) -> pd.DataFrame:
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(prices_worksheet)
     vals = ws.get_all_values()
@@ -28,15 +25,17 @@ def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
 
     df = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
     df.columns = [c.strip().lower() for c in df.columns]
-    rename_map = {}
+
+    # common variants → expected names
+    ren = {}
     if "adj close" in df.columns and "close" not in df.columns:
-        rename_map["adj close"] = "close"
+        ren["adj close"] = "close"
     if "adj_close" in df.columns and "close" not in df.columns:
-        rename_map["adj_close"] = "close"
+        ren["adj_close"] = "close"
     if "volume" in df.columns and "vol" not in df.columns:
-        rename_map["volume"] = "vol"
-    if rename_map:
-        df = df.rename(columns=rename_map)
+        ren["volume"] = "vol"
+    if ren:
+        df = df.rename(columns=ren)
 
     required = {"date", "symbol", "close"}
     missing = required - set(df.columns)
@@ -68,13 +67,12 @@ def load_prices_from_sheet(gc, sheet_id: str, prices_worksheet: str,
             df = df[df["date"] >= cutoff]
 
     cols = ["date", "symbol", "close"] + (["vol"] if "vol" in df.columns else [])
-    df = df[cols].sort_values(["symbol", "date"]).reset_index(drop=True)
-    return df
+    return df[cols].sort_values(["symbol", "date"]).reset_index(drop=True)
 
 def make_features(df_prices: pd.DataFrame) -> pd.DataFrame:
     df = df_prices.copy()
     if "vol" not in df.columns:
-        df["vol"] = 0.0
+        df["vol"] = 0.0  # keep pipeline stable when Volume is absent
     df["ret1"] = df.groupby("symbol")["close"].pct_change()
     df["ma10"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(10).mean())
     df["ma50"] = df.groupby("symbol")["close"].transform(lambda s: s.rolling(50).mean())
@@ -104,8 +102,7 @@ def read_calibration(gc, sheet_id: str, tab: str) -> Dict[str, float]:
         return {}
     header = [h.strip() for h in vals[0]]
     hlow = [h.lower() for h in header]
-    need = ["symbol", "bias_pct"]
-    if any(c not in hlow for c in need):
+    if "symbol" not in hlow or "bias_pct" not in hlow:
         return {}
     i_symbol = hlow.index("symbol")
     i_bias = hlow.index("bias_pct")
@@ -117,7 +114,7 @@ def read_calibration(gc, sheet_id: str, tab: str) -> Dict[str, float]:
             if sym:
                 out[sym] = bias
         except Exception:
-            continue
+            pass
     return out
 
 def sheet_append_rows(gc, sheet_id: str, tab: str, rows: List[List]):
@@ -126,13 +123,13 @@ def sheet_append_rows(gc, sheet_id: str, tab: str, rows: List[List]):
         ws = sh.worksheet(tab)
     except Exception:
         ws = sh.add_worksheet(title=tab, rows=1000, cols=26)
-        ws.append_row(
-            ["timestamp_utc", "symbol", "horizon", "last_close", "predicted",
-             "pct_change", "signal", "scope", "model_kind", "params_json",
-             "train_window", "features", "actual"]
-        )
+        ws.append_row([
+            "timestamp_utc","symbol","horizon","last_close","predicted",
+            "pct_change","signal","scope","model_kind","params_json",
+            "train_window","features","actual"
+        ])
     for i in range(0, len(rows), 1000):
-        ws.append_rows(rows[i:i + 1000], value_input_option="USER_ENTERED")
+        ws.append_rows(rows[i:i+1000], value_input_option="USER_ENTERED")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -151,6 +148,7 @@ def main():
     args = ap.parse_args()
 
     horizons = [int(x) for x in str(args.horizons).split(",") if str(x).strip()]
+
     gc = gspread.service_account(filename=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"))
 
     # Watchlist symbols (case-insensitive header)
@@ -178,37 +176,25 @@ def main():
     scalerd = joblib.load(args.scaler_path)
     scaler, feats_order = scalerd["scaler"], scalerd["feats"]
 
-    # Scale
+    # Scale features
     feat_scaled = feat.copy()
     feat_scaled[feats_order] = scaler.transform(feat_scaled[feats_order].values)
 
     # Optional calibration
     calib = read_calibration(gc, args.sheet_id, args.calibration_worksheet) if args.apply_calibration else {}
 
-    # Collect (symbol, reason) for anything we skip, so the Actions log tells us why.
+    # Logging bucket for skipped symbols
     skipped = []
-    ...
-    for sym, g_scaled in feat_scaled.groupby("symbol"):
-        ...
-        if X is None:
-            skipped.append((sym, f"len<{WINDOW} after features"))
-            continue
-    ...
-    print(f"[predict] symbols={len(set(raw['symbol']))}, rows_out={len(out_rows)}")
-    for s, why in skipped[:50]:
-        print(f"[predict] skip {s}: {why}")
 
-    
     # Predict per symbol
     out_rows: List[List] = []
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
     for sym, g_scaled in feat_scaled.groupby("symbol"):
         g_raw = feat[feat["symbol"] == sym].copy()
-    
-        # Basic sanity before we try to assemble the window
+
         if g_raw.empty:
-            skipped.append((sym, "no rows in features"))
+            skipped.append((sym, "no feature rows"))
             continue
         if len(g_raw) < WINDOW:
             skipped.append((sym, f"raw_len={len(g_raw)} < WINDOW"))
@@ -216,14 +202,13 @@ def main():
         if len(g_scaled) < WINDOW:
             skipped.append((sym, f"scaled_len={len(g_scaled)} < WINDOW"))
             continue
-    
-        # Align last raw closes to the same tail length we’ll use for inference
+
         try:
             g_raw["close_raw"] = raw.loc[raw["symbol"] == sym, "close"].values[-len(g_raw):]
         except Exception:
-            skipped.append((sym, "could not align close_raw"))
+            skipped.append((sym, "close_raw align fail"))
             continue
-    
+
         X, last_close = last_window_tensor(
             pd.concat(
                 [g_scaled.reset_index(drop=True), g_raw[["close_raw"]].reset_index(drop=True)],
@@ -236,14 +221,13 @@ def main():
             skipped.append((sym, "last_window_tensor -> None"))
             continue
 
-
         y_scaled = model.predict(X[None, ...], verbose=0)[0]
         preds = inverse_close_only(np.array(y_scaled), scaler, feats_order)
 
         bias_pct = float(calib.get(sym, 0.0))
-        adj_factor = (1.0 + bias_pct / 100.0)
+        adj_factor = 1.0 + bias_pct / 100.0
 
-        for h, p in zip(horizons, preds[: len(horizons)]):
+        for h, p in zip(horizons, preds[:len(horizons)]):
             p_adj = float(p) * adj_factor
             pct = float((p_adj - last_close) / last_close * 100.0)
             signal = 1 if p_adj > last_close else (-1 if p_adj < last_close else 0)
@@ -256,24 +240,21 @@ def main():
                 json.dumps(params), WINDOW, ",".join(feats_order), ""
             ])
 
-    # Helpful summary in the GitHub Actions log
+    # Helpful summary for Actions logs
     try:
         uniq_in_prices = int(raw["symbol"].nunique())
     except Exception:
         uniq_in_prices = 0
     print(f"[predict] watchlist={len(symbols)}, in_prices={uniq_in_prices}, wrote={len(out_rows)} rows")
-    
     if skipped:
-        # Don’t spam: show at most 50 reasons
         print("[predict] skipped:", ", ".join(f"{s}({why})" for s, why in skipped[:50]))
-    
+
     if not out_rows:
         print("No predictions produced.")
         return
-    
+
     sheet_append_rows(gc, args.sheet_id, args.predictions_tab, out_rows)
     print(f"Wrote {len(out_rows)} predictions to '{args.predictions_tab}'")
-
 
 if __name__ == "__main__":
     main()
