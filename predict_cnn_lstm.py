@@ -185,20 +185,57 @@ def main():
     # Optional calibration
     calib = read_calibration(gc, args.sheet_id, args.calibration_worksheet) if args.apply_calibration else {}
 
+    # Collect (symbol, reason) for anything we skip, so the Actions log tells us why.
+    skipped = []
+    ...
+    for sym, g_scaled in feat_scaled.groupby("symbol"):
+        ...
+        if X is None:
+            skipped.append((sym, f"len<{WINDOW} after features"))
+            continue
+    ...
+    print(f"[predict] symbols={len(set(raw['symbol']))}, rows_out={len(out_rows)}")
+    for s, why in skipped[:50]:
+        print(f"[predict] skip {s}: {why}")
+
+    
     # Predict per symbol
     out_rows: List[List] = []
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
     for sym, g_scaled in feat_scaled.groupby("symbol"):
         g_raw = feat[feat["symbol"] == sym].copy()
-        g_raw["close_raw"] = raw[raw["symbol"] == sym]["close"].values[-len(g_raw):]
-
+    
+        # Basic sanity before we try to assemble the window
+        if g_raw.empty:
+            skipped.append((sym, "no rows in features"))
+            continue
+        if len(g_raw) < WINDOW:
+            skipped.append((sym, f"raw_len={len(g_raw)} < WINDOW"))
+            continue
+        if len(g_scaled) < WINDOW:
+            skipped.append((sym, f"scaled_len={len(g_scaled)} < WINDOW"))
+            continue
+    
+        # Align last raw closes to the same tail length we’ll use for inference
+        try:
+            g_raw["close_raw"] = raw.loc[raw["symbol"] == sym, "close"].values[-len(g_raw):]
+        except Exception:
+            skipped.append((sym, "could not align close_raw"))
+            continue
+    
         X, last_close = last_window_tensor(
-            pd.concat([g_scaled.reset_index(drop=True), g_raw[["close_raw"]].reset_index(drop=True)], axis=1),
-            feats_order, WINDOW
+            pd.concat(
+                [g_scaled.reset_index(drop=True), g_raw[["close_raw"]].reset_index(drop=True)],
+                axis=1
+            ),
+            feats_order,
+            WINDOW
         )
         if X is None:
+            skipped.append((sym, "last_window_tensor -> None"))
             continue
+
 
         y_scaled = model.predict(X[None, ...], verbose=0)[0]
         preds = inverse_close_only(np.array(y_scaled), scaler, feats_order)
@@ -219,11 +256,24 @@ def main():
                 json.dumps(params), WINDOW, ",".join(feats_order), ""
             ])
 
+    # Helpful summary in the GitHub Actions log
+    try:
+        uniq_in_prices = int(raw["symbol"].nunique())
+    except Exception:
+        uniq_in_prices = 0
+    print(f"[predict] watchlist={len(symbols)}, in_prices={uniq_in_prices}, wrote={len(out_rows)} rows")
+    
+    if skipped:
+        # Don’t spam: show at most 50 reasons
+        print("[predict] skipped:", ", ".join(f"{s}({why})" for s, why in skipped[:50]))
+    
     if not out_rows:
         print("No predictions produced.")
         return
+    
     sheet_append_rows(gc, args.sheet_id, args.predictions_tab, out_rows)
     print(f"Wrote {len(out_rows)} predictions to '{args.predictions_tab}'")
+
 
 if __name__ == "__main__":
     main()
