@@ -98,7 +98,6 @@ jobs:
       # 2) Refresh calibration from history so future predictions use updated bias fixes
       - name: Update calibration from history
         run: |
-          set -euxo pipefail
           python calibrate_from_history.py \
             --sheet-id "$SHEET_ID" \
             --predictions-worksheet "$PREDICTIONS_TAB" \
