@@ -77,11 +77,12 @@ jobs:
           PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
           CALIBRATIONS_TAB: ${{ env.CALIBRATIONS_TAB }}
         run: |
-          set -euxo pipefail
-          python calibrate_from_history.py \
-            --sheet-id "$SHEET_ID" \
-            --predictions-worksheet "$PREDICTIONS_TAB" \
-            --output-worksheet "$CALIBRATIONS_TAB"
+            python calibrate_from_history.py \
+            --sheet-id "${{SHEET_ID}}" \
+            --predictions-worksheet "${{PREDICTIONS_TAB}}" \
+            --output-worksheet "${{CALIBRATIONS_TAB}}"
+            --lookback-days 60 \
+            --min-samples 30
 
       - name: Upload logs (optional)
         if: always()
