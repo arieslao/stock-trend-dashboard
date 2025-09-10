@@ -1,7 +1,19 @@
 # evaluate_predictions.py — fill 'actual', 'error_pct', 'direction_hit' for matured predictions
 import os, argparse
 import pandas as pd
+import datetime as dt
 import gspread
+
+# Parse due_date even if stored as text (e.e., '2025-09-08)
+df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce').dt.date
+today = dt.date.today()
+
+# Treat -1 (string or number) and blank as "not yet evaluated"
+def is_missing_actual(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors='coerce') # turns '', None -> Nan; '-1', '-1.0' -> '-1'
+    return s.isna() | (s == -1)
+
+pending = dr[ is_missing_actual(df['acutal']) & (df['due_date'] <=today) ]
 
 def ensure_cols(ws, header, need):
     """Ensure evaluation columns exist (case-preserving)."""
