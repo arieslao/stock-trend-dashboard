@@ -6,7 +6,8 @@ import gspread
 
 
 # Parse due_date even if stored as text (e.e., '2025-09-08)
-df['due_date'] = pd.to_datetime(df['due_date'], errors='coerce').dt.date
+
+preds['due_date'] = pd.to_datetime(preds['due_date'], errors='coerce').dt.date
 today = dt.date.today()
 
 # Treat -1 (string or number) and blank as "not yet evaluated"
