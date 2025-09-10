@@ -2,9 +2,9 @@ name: Evaluate & Calibrate (learn from past predictions)
 
 on:
   schedule:
-    # Run shortly after US market close (20:10 UTC ≈ 4:10 pm ET; adjust if you like)
+    # Run shortly after US market close (20:10 UTC ≈ 4:10pm ET). Adjust as needed.
     - cron: '10 20 * * 1-5'
-  workflow_dispatch: {}   # allow manual runs
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -18,10 +18,14 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
+      # Sheet ID comes from repo secrets
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+
       # Sheets tabs — change if your tab names differ
-      PREDICTIONS_TAB: predictions
       PRICES_TAB: prices
-      CALIBRATIONS_TAB: calibration
+      PREDICTIONS_TAB: predictions
+      EVAL_TAB: model_eval
+      CALIBRATION_TAB: calibration
 
     steps:
       - name: Checkout repo
@@ -49,38 +53,56 @@ jobs:
           cp "$RUNNER_TEMP/sa.json" "$HOME/.config/gspread/service_account.json"
           python - <<'PY'
           import json, os
-          json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "sa.json")))
-          print("Service account JSON validated")
+          for p in [os.path.join(os.environ["RUNNER_TEMP"], "sa.json"),
+                    os.path.expanduser("~/.config/gspread/service_account.json")]:
+              json.load(open(p))
+              print("Service account JSON validated at:", p)
           PY
-        shell: bash
 
       - name: Configure Google credentials env var
         run: echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
 
+      - name: Ensure required Sheets tabs exist
+        run: |
+          python - <<'PY'
+          import os, gspread
+          creds = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+          gc = gspread.service_account(filename=creds)
+          sh = gc.open_by_key(os.environ["SHEET_ID"])
+
+          need = [
+            os.environ["PRICES_TAB"],
+            os.environ["PREDICTIONS_TAB"],
+            os.environ["EVAL_TAB"],
+            os.environ["CALIBRATION_TAB"],
+          ]
+          existing = {ws.title for ws in sh.worksheets()}
+          for t in need:
+            if t not in existing:
+              print("Creating missing worksheet:", t)
+              sh.add_worksheet(title=t, rows=200, cols=26)
+            else:
+              print("Worksheet exists:", t)
+          PY
+
       # 1) Score any past-due predictions using actuals from your prices tab
       - name: Evaluate past-due predictions
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
-          PRICES_TAB: ${{ env.PRICES_TAB }}
         run: |
           set -euxo pipefail
           python evaluate_predictions.py \
             --sheet-id "$SHEET_ID" \
             --predictions-worksheet "$PREDICTIONS_TAB" \
-            --prices-worksheet "$PRICES_TAB"
+            --prices-worksheet "$PRICES_TAB" \
+            --output-worksheet "$EVAL_TAB"
 
       # 2) Refresh calibration from history so future predictions use updated bias fixes
       - name: Update calibration from history
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
-          CALIBRATIONS_TAB: ${{ env.CALIBRATIONS_TAB }}
         run: |
-            python calibrate_from_history.py \
-            --sheet-id "${{SHEET_ID}}" \
-            --predictions-worksheet "${{PREDICTIONS_TAB}}" \
-            --output-worksheet "${{CALIBRATIONS_TAB}}"
+          set -euxo pipefail
+          python calibrate_from_history.py \
+            --sheet-id "$SHEET_ID" \
+            --predictions-worksheet "$PREDICTIONS_TAB" \
+            --calibration-worksheet "$CALIBRATION_TAB" \
             --lookback-days 60 \
             --min-samples 30
 
