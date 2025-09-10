@@ -2,8 +2,8 @@ name: Evaluate & Calibrate (learn from past predictions)
 
 on:
   schedule:
-    # Run shortly after US market close (20:10 UTC ≈ 4:10pm ET)
-    - cron: "10 20 * * 1-5"
+    # Shortly after US market close (20:10 UTC ≈ 4:10pm ET)
+    - cron: '10 20 * * 1-5'
   workflow_dispatch: {}
 
 permissions:
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      # Update these if your tab names differ
+      # Sheets tabs — change these if your tab names differ
       PREDICTIONS_TAB: predictions
       PRICES_TAB: prices
       CALIBRATIONS_TAB: calibration
@@ -30,19 +30,19 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-version: '3.10'
+          cache: 'pip'
           cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Write Google service account JSON
         env:
           GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
-        shell: bash
         run: |
           set -euxo pipefail
           echo "$GOOGLE_SHEETS_JSON" > "$RUNNER_TEMP/sa.json"
@@ -53,38 +53,28 @@ jobs:
           json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "sa.json")))
           print("Service account JSON validated")
           PY
+        shell: bash
 
       - name: Configure Google credentials env var
         run: echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/sa.json" >> "$GITHUB_ENV"
 
       - name: Ensure required Sheets tabs exist (optional but helpful)
-        if: always()
         env:
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          PREDICTIONS_TAB: ${{ env.PREDICTIONS_TAB }}
+          PRICES_TAB: ${{ env.PRICES_TAB }}
           CALIBRATIONS_TAB: ${{ env.CALIBRATIONS_TAB }}
         run: |
           python - <<'PY'
-          import os, datetime as dt
-          import gspread
-
-          sheet_id = os.environ["SHEET_ID"]
-          calib_tab = os.environ["CALIBRATIONS_TAB"]
-
+          import os, gspread
           gc = gspread.service_account()
-          sh = gc.open_by_key(sheet_id)
-
-          # Create calibration tab if missing with reasonable headers
-          headers = [
-              "symbol","horizon","feature_set",
-              "bin_center","quantile","offset","scale",
-              "n","mae","rmse","updated_at_utc"
-          ]
-
-          try:
-              ws = sh.worksheet(calib_tab)
-          except gspread.WorksheetNotFound:
-              ws = sh.add_worksheet(title=calib_tab, rows=1000, cols=len(headers))
-              ws.update("A1:K1", [headers])
+          sh = gc.open_by_key(os.environ["SHEET_ID"])
+          need = [os.environ["PREDICTIONS_TAB"], os.environ["PRICES_TAB"], os.environ["CALIBRATIONS_TAB"]]
+          existing = {ws.title for ws in sh.worksheets()}
+          for t in need:
+            if t not in existing:
+              sh.add_worksheet(title=t, rows=1000, cols=26)
+              print(f"Created missing tab: {t}")
           PY
 
       # 1) Score any past-due predictions using actuals from your prices tab
@@ -111,7 +101,7 @@ jobs:
           python calibrate_from_history.py \
             --sheet-id "$SHEET_ID" \
             --predictions-worksheet "$PREDICTIONS_TAB" \
-            --output-worksheet "$CALIBRATIONS_TAB" \
+            --calibration-worksheet "$CALIBRATIONS_TAB" \
             --lookback-days 60 \
             --min-samples 30
 
