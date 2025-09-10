@@ -1,177 +1,216 @@
-# evaluate_predictions.py — fill 'actual', 'error_pct', 'direction_hit' for matured predictions
-import os, argparse
-import pandas as pd
+#!/usr/bin/env python3
+"""
+Evaluate matured predictions by filling `actual`, `error_pct`, `direction_hit`,
+and `evaluated_at_utc` on the predictions sheet.
+
+- `actual` = realized % return from `last_close` to the closing price on `due_date`
+- `error_pct` = predicted - actual   (both in percentage points)
+- `direction_hit` = 1 if sign(predicted) == sign(actual) else 0
+
+Requires:
+  - A Google service account (GOOGLE_APPLICATION_CREDENTIALS env var or
+    gspread default service_account file).
+  - Sheets:
+      predictions: timestamp_utc, symbol, horizon, last_close, predicted,
+                   signal, actual, due_date, error_pct, direction_hit,
+                   evaluated_at_utc, feature_set (extra columns are OK)
+      prices:     must include (symbol, date, close-like column)
+
+Usage:
+  python evaluate_predictions.py \
+    --sheet-id SHEET_ID \
+    --predictions-worksheet predictions \
+    --prices-worksheet prices
+"""
+from __future__ import annotations
+
+import argparse
 import datetime as dt
+import math
+import os
+from typing import Optional
+
+import numpy as np
+import pandas as pd
 import gspread
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
-# Parse due_date even if stored as text (e.e., '2025-09-08)
 
-preds['due_date'] = pd.to_datetime(preds['due_date'], errors='coerce').dt.date
-today = dt.date.today()
+# ---------- helpers ----------
 
-# Treat -1 (string or number) and blank as "not yet evaluated"
-def is_missing_actual(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors='coerce') # turns '', None -> Nan; '-1', '-1.0' -> '-1'
-    return s.isna() | (s == -1)
+def _service_client() -> gspread.Client:
+    # Uses GOOGLE_APPLICATION_CREDENTIALS if present; otherwise
+    # looks for ~/.config/gspread/service_account.json
+    if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        return gspread.service_account(
+            filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        )
+    return gspread.service_account()
 
-pending = dr[ is_missing_actual(df['acutal']) & (df['due_date'] <=today) ]
+def _open_ws(gc: gspread.Client, sheet_id: str, title: str) -> gspread.Worksheet:
+    sh = gc.open_by_key(sheet_id)
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        raise SystemExit(f"Worksheet '{title}' not found in spreadsheet {sheet_id}")
 
-def ensure_cols(ws, header, need):
-    """Ensure evaluation columns exist (case-preserving)."""
-    to_add = [c for c in need if c not in header]
-    if to_add:
-        ws.update("A1", [header + to_add])
-        header = header + to_add
-    idx = {c: header.index(c) for c in header}
-    return header, idx
+def _coerce_datetime_date(s: pd.Series) -> pd.Series:
+    # Accepts strings, datetimes; returns `date` objects (or NaT -> NaN)
+    vals = pd.to_datetime(s, errors="coerce", utc=True)
+    return vals.dt.tz_convert(None).dt.date
 
-def nearest_close_on_or_after(pdf: pd.DataFrame, sym: str, target_date: pd.Timestamp):
-    g = pdf[pdf["symbol"] == sym]
-    if g.empty:
-        return None
-    m = g[g["date"] >= target_date]
-    if m.empty:
-        return None
-    return float(m.iloc[0]["close"])
+def _close_column(prices_df: pd.DataFrame) -> str:
+    for cand in ("close", "close_raw", "adj_close", "Close", "Adj Close"):
+        if cand in prices_df.columns:
+            return cand
+    raise SystemExit(
+        "Could not find a close price column in prices sheet "
+        "(looked for: close, close_raw, adj_close, Close, Adj Close)."
+    )
+
+def _to_float(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+def _now_utc_iso() -> str:
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+# ---------- core ----------
+
+def load_predictions(ws: gspread.Worksheet) -> pd.DataFrame:
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+    # Drop completely empty rows
+    df = df.dropna(how="all")
+    # Normalize expected columns if present
+    if "due_date" in df.columns:
+        df["due_date"] = _coerce_datetime_date(df["due_date"])
+    if "timestamp_utc" in df.columns:
+        # keep as timestamp string; not strictly needed
+        pass
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+    if "horizon" in df.columns:
+        df["horizon"] = pd.to_numeric(df["horizon"], errors="coerce").astype("Int64")
+    if "last_close" in df.columns:
+        df["last_close"] = _to_float(df["last_close"])
+    if "predicted" in df.columns:
+        df["predicted"] = _to_float(df["predicted"])
+    # Ensure destination columns exist
+    for col in ("actual", "error_pct", "direction_hit", "evaluated_at_utc"):
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+def load_prices(ws: gspread.Worksheet) -> pd.DataFrame:
+    p = get_as_dataframe(ws, evaluate_formulas=True, header=0).dropna(how="all")
+    # Find a date-like column
+    date_col = None
+    for cand in ("date", "timestamp", "timestamp_utc", "Date"):
+        if cand in p.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        raise SystemExit("Prices sheet needs a date/timestamp column (date/timestamp/timestamp_utc).")
+    p["symbol"] = p["symbol"].astype(str).str.strip()
+    p["trade_date"] = _coerce_datetime_date(p[date_col])
+    close_col = _close_column(p)
+    p = p[["symbol", "trade_date", close_col]].dropna(subset=["symbol", "trade_date"])
+    p = p.rename(columns={close_col: "close_px"})
+    return p
+
+def build_price_lookup(prices: pd.DataFrame):
+    # Build a quick lookup dict: (symbol, date) -> close
+    return {(r.symbol, r.trade_date): r.close_px for r in prices.itertuples()}
+
+def evaluate_rows(preds: pd.DataFrame, price_lut) -> pd.DataFrame:
+    """
+    Return a copy of preds with matured rows updated.
+    A row is 'matured' if:
+      - due_date is not NaN
+      - actual is NaN or -1
+      - we have a closing price for (symbol, due_date)
+    """
+    df = preds.copy()
+    # Normalize 'actual' to float (it might contain sentinel -1 as string)
+    df["actual"] = _to_float(df["actual"])
+
+    def can_eval(row) -> bool:
+        if pd.isna(row.get("due_date")):
+            return False
+        if not isinstance(row.get("symbol"), str) or pd.isna(row.get("symbol")):
+            return False
+        # only fill if not already evaluated or marked as missing
+        if not (pd.isna(row["actual"]) or float(row["actual"]) == -1.0):
+            return False
+        return (row["symbol"], row["due_date"]) in price_lut
+
+    matured_idx = [i for i, r in df.iterrows() if can_eval(r)]
+    if not matured_idx:
+        return df  # nothing to do
+
+    for i in matured_idx:
+        r = df.loc[i]
+        last_close = r.get("last_close")
+        predicted = r.get("predicted")
+        symbol = r.get("symbol")
+        due_date = r.get("due_date")
+
+        if pd.isna(last_close) or pd.isna(predicted):
+            # can't evaluate this one
+            continue
+
+        close_due = price_lut.get((symbol, due_date))
+        if close_due is None or pd.isna(close_due):
+            continue
+
+        # realized percent return
+        actual_pct = (close_due - float(last_close)) / float(last_close) * 100.0
+        # prediction error (in pct points)
+        err = float(predicted) - float(actual_pct)
+
+        # direction hit (1 if same sign, else 0; treat 0 as miss)
+        hit = 1 if (actual_pct > 0 and predicted > 0) or (actual_pct < 0 and predicted < 0) else 0
+
+        df.at[i, "actual"] = round(actual_pct, 6)
+        df.at[i, "error_pct"] = round(err, 6)
+        df.at[i, "direction_hit"] = int(hit)
+        df.at[i, "evaluated_at_utc"] = _now_utc_iso()
+
+    return df
+
+def write_back(ws: gspread.Worksheet, df: pd.DataFrame):
+    # Write whole sheet back to keep things simple & consistent
+    ws.clear()
+    set_with_dataframe(ws, df, include_index=False, resize=True)
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet-id", required=True)
-    ap.add_argument("--predictions-worksheet", default="predictions")
-    ap.add_argument("--prices-worksheet", default="prices")
+    ap.add_argument("--predictions-worksheet", required=True)
+    ap.add_argument("--prices-worksheet", required=True)
     args = ap.parse_args()
 
-    gc = gspread.service_account(filename=os.environ["GOOGLE_APPLICATION_CREDENTIALS"])
-    sh = gc.open_by_key(args.sheet_id)
+    gc = _service_client()
+    preds_ws = _open_ws(gc, args.sheet_id, args.predictions_worksheet)
+    prices_ws = _open_ws(gc, args.sheet_id, args.prices_worksheet)
 
-    # ---------- PRICES (case-insensitive) ----------
-    wprices = sh.worksheet(args.prices_worksheet)
-    vals = wprices.get_all_values()
-    if not vals or len(vals) < 2:
-        raise RuntimeError(f"'{args.prices_worksheet}' is empty or missing headers")
+    preds = load_predictions(preds_ws)
+    prices = load_prices(prices_ws)
+    price_lut = build_price_lookup(prices)
 
-    prices = pd.DataFrame(vals[1:], columns=[h.strip() for h in vals[0]])
-    prices.columns = [c.strip().lower() for c in prices.columns]
+    updated = evaluate_rows(preds, price_lut)
 
-    # map common variants → expected names
-    rename_map = {}
-    if "adj close" in prices.columns and "close" not in prices.columns:
-        rename_map["adj close"] = "close"
-    if "adj_close" in prices.columns and "close" not in prices.columns:
-        rename_map["adj_close"] = "close"
-    if "volume" in prices.columns and "vol" not in prices.columns:
-        rename_map["volume"] = "vol"
-    if rename_map:
-        prices = prices.rename(columns=rename_map)
+    # Only write if anything changed in the evaluation fields
+    changed = not updated[["actual", "error_pct", "direction_hit", "evaluated_at_utc"]].equals(
+        preds[["actual", "error_pct", "direction_hit", "evaluated_at_utc"]]
+    )
+    if changed:
+        write_back(preds_ws, updated)
+        print("Evaluation complete: wrote updates to predictions sheet.")
+    else:
+        print("Evaluation done: no matured rows to update.")
 
-    required = {"date", "symbol", "close"}
-    missing = required - set(prices.columns)
-    if missing:
-        raise RuntimeError(
-            f"'{args.prices_worksheet}' missing required columns: {missing}. "
-            f"Found: {list(prices.columns)}"
-        )
-
-    prices["date"] = pd.to_datetime(prices["date"], utc=True, errors="coerce").dt.tz_localize(None)
-    prices["close"] = pd.to_numeric(prices["close"], errors="coerce")
-    if "vol" in prices.columns:
-        prices["vol"] = pd.to_numeric(prices["vol"], errors="coerce")
-    prices["symbol"] = prices["symbol"].astype(str).str.upper().str.strip()
-    prices = prices.dropna(subset=["date", "close"]).sort_values(["symbol", "date"])
-    pdf = prices
-
-    # ---------- PREDICTIONS (create if missing; handle empty) ----------
-    try:
-        wpred = sh.worksheet(args.predictions_worksheet)
-    except gspread.exceptions.WorksheetNotFound:
-        wpred = sh.add_worksheet(title=args.predictions_worksheet, rows=2000, cols=20)
-        wpred.update("A1", [[
-            "timestamp_utc","symbol","horizon","last_close","predicted",
-            "pct_change","signal","scope","model_kind","params_json",
-            "train_window","features","actual"
-        ]])
-        print(f"Created '{args.predictions_worksheet}' and found nothing to evaluate today.")
-        return
-
-    vals = wpred.get_all_values()
-    if not vals:
-        print(f"'{args.predictions_worksheet}' has no header/rows; nothing to evaluate.")
-        return
-
-    header_orig = [h.strip() for h in vals[0]]
-    need_cols = ["due_date", "error_pct", "direction_hit", "evaluated_at_utc"]
-    header_orig, _ = ensure_cols(wpred, header_orig, need_cols)
-
-    # refresh after potential header update
-    vals = wpred.get_all_values()
-    header_lc = [h.strip().lower() for h in vals[0]]
-    hi = {c: header_lc.index(c) for c in header_lc}
-    rows = vals[1:]
-
-    req = ["timestamp_utc", "symbol", "horizon", "last_close", "predicted", "signal", "actual"]
-    missing = [c for c in req if c not in hi]
-    if missing:
-        raise SystemExit(f"'{args.predictions_worksheet}' missing {missing}")
-
-    updates = []
-    now = pd.Timestamp.utcnow().tz_localize(None)
-
-    for r_idx, r in enumerate(rows, start=2):
-        sym = str(r[hi["symbol"]]).strip().upper() if hi["symbol"] < len(r) else ""
-        if not sym:
-            continue
-
-        ts_str = r[hi["timestamp_utc"]] if hi["timestamp_utc"] < len(r) else ""
-        if not ts_str:
-            continue
-        ts = pd.to_datetime(ts_str, errors="coerce", utc=True).tz_localize(None)
-        if pd.isna(ts):
-            continue
-
-        actual_cell = r[hi["actual"]].strip() if hi["actual"] < len(r) and r[hi["actual"]] else ""
-        try:
-            hor = int(float(r[hi["horizon"]])) if r[hi["horizon"]] else None
-            last_c = float(r[hi["last_close"]]) if r[hi["last_close"]] else None
-            pred_p = float(r[hi["predicted"]]) if r[hi["predicted"]] else None
-            signal = int(float(r[hi["signal"]])) if r[hi["signal"]] else 0
-        except Exception:
-            continue
-        if hor is None or last_c is None or pred_p is None:
-            continue
-
-        due = ts.normalize() + pd.Timedelta(days=hor)
-        if "due_date" in hi:
-            updates.append({"range": f"{chr(65 + hi['due_date'])}{r_idx}", "values": [[due.date().isoformat()]]})
-
-        # only evaluate after due date and if 'actual' still empty
-        if now < due or actual_cell:
-            continue
-
-        actual = nearest_close_on_or_after(pdf, sym, due)
-        if actual is None:
-            continue
-
-        err_pct = ((actual - pred_p) / pred_p) * 100.0
-        delta = actual - last_c
-        dir_hit = 1 if (delta > 0 and signal > 0) or (delta < 0 and signal < 0) or (delta == 0 and signal == 0) else 0
-
-        updates.extend([
-            {"range": f"{chr(65 + hi['actual'])}{r_idx}",            "values": [[round(actual, 6)]]},
-            {"range": f"{chr(65 + hi['error_pct'])}{r_idx}",         "values": [[round(err_pct, 4)]]},
-            {"range": f"{chr(65 + hi['direction_hit'])}{r_idx}",     "values": [[dir_hit]]},
-            {"range": f"{chr(65 + hi['evaluated_at_utc'])}{r_idx}",  "values": [[now.replace(microsecond=0).isoformat() + "Z"]]},
-        ])
-
-    if not updates:
-        print("No predictions to evaluate today.")
-        return
-
-    # batch updates
-    for i in range(0, len(updates), 500):
-        batch = updates[i:i+500]
-        wpred.batch_update([{"range": u["range"], "values": u["values"]} for u in batch])
-
-    print("Evaluation done.")
 
 if __name__ == "__main__":
     main()
