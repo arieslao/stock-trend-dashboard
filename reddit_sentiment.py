@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-Reddit Sentiment Ingestion (robust + idempotent)
+Reddit Sentiment Ingestion (robust + idempotent, independent of models/fundamentals)
 
-Fixes:
-- If a sheet already exists, don't crash; just fetch it and continue.
-- If 'Watchlist' is missing, create it with a 'Ticker' header.
-- Header bootstrap for empty sheets.
+What this does
+- Pulls recent Reddit posts/comments from selected subreddits
+- Extracts tickers from $CASHTAGs (uppercase only, by design) and from plain tokens IF in your Watchlist
+- Scores sentiment with VADER (+WSB/finance slang tweaks)
+- Weights by upvotes/comments/awards and influencer usernames
+- Appends results to Google Sheet tabs: 'Sentiment' and 'Sentiment_Top'
 
-ENV VARS (required):
+Fixes / Guarantees
+- Case/whitespace-insensitive worksheet lookup (won’t crash if sheet exists)
+- Gracefully handles “already exists” when creating sheets
+- Auto-creates 'Watchlist' with a 'Ticker' header if missing
+- Adds headers if a sheet is empty
+
+Required ENV
   REDDIT_CLIENT_ID
   REDDIT_CLIENT_SECRET
   REDDIT_USER_AGENT
-  GOOGLE_SHEETS_JSON
-  GOOGLE_SHEET_ID
+  GOOGLE_SHEETS_JSON      (full JSON string of service account key)
+  GOOGLE_SHEET_ID         (target Google Sheet ID)
 
-Optional:
-  SUBREDDITS (default: "wallstreetbets,stocks,investing")
-  LOOKBACK_HOURS (default: "24")
-  MAX_POSTS_PER_SUBREDDIT (default: "300")
-  MAX_COMMENTS_PER_POST (default: "200")
-  MIN_POST_SCORE (default: "1")
-  INFLUENCERS (default: "DeepFuckingValue,RoaringKitty")
-  SENTIMENT_SHEET_NAME (default: "Sentiment")
-  WATCHLIST_SHEET_NAME (default: "Watchlist")
+Optional ENV (defaults shown)
+  SUBREDDITS="wallstreetbets,stocks,investing"
+  LOOKBACK_HOURS="24"
+  MAX_POSTS_PER_SUBREDDIT="300"
+  MAX_COMMENTS_PER_POST="200"
+  MIN_POST_SCORE="1"
+  INFLUENCERS="DeepFuckingValue,RoaringKitty"
+  SENTIMENT_SHEET_NAME="Sentiment"
+  WATCHLIST_SHEET_NAME="Watchlist"
 """
 
 import os, json, math, time, re, sys
@@ -31,9 +39,10 @@ import pandas as pd
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound, APIError
+
 import praw
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from gspread.exceptions import WorksheetNotFound, APIError
 
 # ---------- ENV & CONFIG ----------
 SUBREDDITS = [s.strip() for s in os.getenv("SUBREDDITS", "wallstreetbets,stocks,investing").split(",") if s.strip()]
@@ -41,7 +50,7 @@ LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
 MAX_POSTS_PER_SUB = int(os.getenv("MAX_POSTS_PER_SUBREDDIT", "300"))
 MAX_COMMENTS_PER_POST = int(os.getenv("MAX_COMMENTS_PER_POST", "200"))
 MIN_POST_SCORE = int(os.getenv("MIN_POST_SCORE", "1"))
-INFLUENCERS = set(u.strip().lower() for u in os.getenv("INFLUENCERS", "DeepFuckingValue,RoaringKitty").split(",") if u.strip())
+INFLUENCERS = {u.strip().lower() for u in os.getenv("INFLUENCERS", "DeepFuckingValue,RoaringKitty").split(",") if u.strip()}
 SENTIMENT_SHEET_NAME = os.getenv("SENTIMENT_SHEET_NAME", "Sentiment")
 WATCHLIST_SHEET_NAME = os.getenv("WATCHLIST_SHEET_NAME", "Watchlist")
 
@@ -52,64 +61,75 @@ REQUIRED_ENV = [
     "GOOGLE_SHEETS_JSON",
     "GOOGLE_SHEET_ID",
 ]
-missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
-if missing:
-    sys.exit(f"Missing required env vars: {', '.join(missing)}")
+_missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+if _missing:
+    sys.exit(f"Missing required env vars: {', '.join(_missing)}")
 
-# ---------- SHEETS AUTH ----------
+# ---------- SHEETS HELPERS ----------
+def _norm(title: str) -> str:
+    return (title or "").strip().lower()
+
 def auth_sheets():
     info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+    return gspread.authorize(creds).open_by_key(os.getenv("GOOGLE_SHEET_ID"))
 
-def ensure_worksheet(ss, title, header):
+def get_ws(ss, title: str):
+    """Robust worksheet getter (case/whitespace-insensitive)."""
+    want = _norm(title)
+    for ws in ss.worksheets():
+        if _norm(ws.title) == want:
+            return ws
+    try:
+        return ss.worksheet(title)
+    except WorksheetNotFound:
+        return None
+
+def ensure_ws(ss, title: str, header: list[str]):
     """
     Idempotent worksheet getter/creator:
     - Try to fetch
-    - If not found, try to create
+    - If missing, try to create
     - If API says 'already exists', fetch again
-    - Ensure header exists if sheet is empty
+    - If empty, add header
     """
-    try:
-        ws = ss.worksheet(title)
-    except WorksheetNotFound:
+    ws = get_ws(ss, title)
+    if ws is None:
         try:
-            ws = ss.add_worksheet(title=title, rows=1000, cols=max(26, len(header)))
+            ws = ss.add_worksheet(title=title, rows=1000, cols=max(26, len(header or [])))
         except APIError as e:
-            # If another run created it moments ago or it already existed, fetch it
             if "already exists" in str(e).lower():
-                ws = ss.worksheet(title)
+                ws = get_ws(ss, title)
+                if ws is None:
+                    raise
             else:
                 raise
-
-    # Ensure header row
+    # Ensure header if empty
     values = ws.get_all_values()
-    if not values:
-        if header:
-            ws.append_row(header)
+    if len(values) == 0 and header:
+        ws.append_row(header)
+    return ws
+
+def ensure_watchlist(ss):
+    """Guarantee a Watchlist sheet with a 'Ticker' header."""
+    wl = get_ws(ss, WATCHLIST_SHEET_NAME)
+    if wl is None:
+        wl = ss.add_worksheet(title=WATCHLIST_SHEET_NAME, rows=100, cols=2)
+        wl.append_row(["Ticker"])
     else:
-        # If a header is present but doesn't match length, we don't mutate; we just proceed.
-        pass
-    return ws
+        vals = wl.get_all_values()
+        if len(vals) == 0:
+            wl.append_row(["Ticker"])
+    return wl
 
-def ensure_watchlist_sheet(ss):
-    """
-    Guarantee a Watchlist sheet with a 'Ticker' header exists.
-    """
-    wl_header = ["Ticker"]
-    ws = ensure_worksheet(ss, WATCHLIST_SHEET_NAME, wl_header)
-    # If empty besides header, fine. If user has entries, they'll be in col A.
-    return ws
-
-def read_watchlist(ss):
-    ws = ensure_watchlist_sheet(ss)
-    vals = ws.col_values(1)  # Column A
+def read_watchlist(ss) -> set[str]:
+    wl = ensure_watchlist(ss)
+    vals = wl.col_values(1)  # Column A
     tickers = set()
     # Drop header if present
-    start_idx = 1 if vals and vals[0].strip().lower() in ("ticker", "tickers", "symbol", "symbols") else 0
-    for v in vals[start_idx:]:
+    start = 2 if (vals and vals[0].strip().lower() in ("ticker","tickers","symbol","symbols")) else 1
+    for v in vals[start-1:]:
         sym = (v or "").strip().upper()
         if sym and 1 <= len(sym) <= 5 and sym.isalpha():
             tickers.add(sym)
@@ -124,9 +144,10 @@ def auth_reddit():
         ratelimit_seconds=5,
     )
 
-# ---------- NLP ----------
+# ---------- SENTIMENT ----------
 def make_vader():
     an = SentimentIntensityAnalyzer()
+    # Augment lexicon for finance/WSB slang
     tweaks = {
         "bullish": 2.3, "bearish": -2.3,
         "to the moon": 2.5, "🚀": 2.4, "rocket": 1.5,
@@ -135,29 +156,32 @@ def make_vader():
         "rug pull": -2.4, "yolo": 0.5, "tendies": 1.8,
         "squeeze": 1.2, "short squeeze": 2.2, "gamma squeeze": 2.0
     }
-    for k, v in tweaks.items():
-        an.lexicon[k] = v
+    an.lexicon.update(tweaks)
     return an
 
+# Keep original behavior: only uppercase $CASHTAGs count by regex;
+# plain (non-cashtag) uppercase tokens count only if in Watchlist.
 TICKER_CASHTAG_RE = re.compile(r'\$([A-Z]{1,5})\b')
-def extract_mentions(text, watchlist):
+
+def extract_mentions(text: str, watchlist: set[str]) -> set[str]:
     found = set(TICKER_CASHTAG_RE.findall(text))
-    for t in re.findall(r'\b[A-Z]{1,5}\b', text):
-        if t in watchlist:
-            found.add(t)
+    # Also allow plain uppercase tokens but ONLY if the symbol is in Watchlist (reduces false positives)
+    for token in re.findall(r'\b[A-Z]{1,5}\b', text):
+        if token in watchlist:
+            found.add(token)
     return found
 
-def analyze_text(analyzer, text: str):
+def analyze_text(analyzer, text: str) -> dict:
     s = analyzer.polarity_scores(text)
     return {"pos": s["pos"], "neu": s["neu"], "neg": s["neg"], "compound": s["compound"]}
 
-def weight_from_post_score(score: int, num_comments: int, awards: int) -> float:
-    w = 1.0 + math.log10(1 + max(0, score)) + 0.2 * math.log10(1 + max(0, num_comments))
+def w_post(score: int, n_comments: int, awards: int) -> float:
+    w = 1.0 + math.log10(1 + max(0, score)) + 0.2 * math.log10(1 + max(0, n_comments))
     if awards and awards > 0:
         w += 0.3
     return max(0.5, min(w, 5.0))
 
-def weight_from_comment_score(score: int) -> float:
+def w_comment(score: int) -> float:
     w = 1.0 + 0.5 * math.log10(1 + max(0, score))
     return max(0.5, min(w, 3.0))
 
@@ -166,6 +190,7 @@ def influence_bonus(author: str) -> float:
 
 # ---------- FETCH ----------
 def fetch_recent_items(r, subreddits, cutoff_utc):
+    """Yield dicts for posts and comments newer than cutoff_utc."""
     for sub in subreddits:
         subreddit = r.subreddit(sub)
         streams = [("new", MAX_POSTS_PER_SUB), ("hot", max(50, MAX_POSTS_PER_SUB // 5))]
@@ -228,11 +253,14 @@ def main():
 
     # Watchlist (guaranteed to exist)
     watchlist = read_watchlist(ss)
+    if not watchlist:
+        print("[WARN] Watchlist empty — only $CASHTAG mentions will be captured.")
 
     # Time window
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     cutoff_utc = cutoff_dt.timestamp()
 
+    # Aggregate
     per_ticker = {}
     for item in fetch_recent_items(r, SUBREDDITS, cutoff_utc):
         if item["type"] == "post":
@@ -241,7 +269,8 @@ def main():
             if not mentions:
                 continue
             s = analyze_text(analyzer, text)
-            w = weight_from_post_score(item["score"], item["num_comments"], item["awards"]) + influence_bonus(item["author"])
+            w = w_post(item["score"], item["num_comments"], item["awards"]) + influence_bonus(item["author"])
+
             for tk in mentions:
                 agg = per_ticker.setdefault(tk, {
                     "mentions": 0, "weighted_compound_sum": 0.0, "weight_sum": 0.0,
@@ -260,13 +289,14 @@ def main():
                 if item["author"] and item["author"].lower() in INFLUENCERS:
                     agg["influencer_mentions"] += 1
 
-        elif item["type"] == "comment":
+        else:  # comment
             text = item["body"]
             mentions = extract_mentions(text, watchlist)
             if not mentions:
                 continue
             s = analyze_text(analyzer, text)
-            w = weight_from_comment_score(item["score"]) + influence_bonus(item["author"])
+            w = w_comment(item["score"]) + influence_bonus(item["author"])
+
             for tk in mentions:
                 agg = per_ticker.setdefault(tk, {
                     "mentions": 0, "weighted_compound_sum": 0.0, "weight_sum": 0.0,
@@ -301,4 +331,54 @@ def main():
 
         rows.append({
             "date": run_date,
-            "timestamp": run_t_
+            "timestamp": run_ts,
+            "source": "reddit",
+            "ticker": tk,
+            "mentions": a["mentions"],
+            "avg_compound": round(avg_compound, 4),
+            "pos_ratio": round(pos_ratio, 4),
+            "neg_ratio": round(neg_ratio, 4),
+            "neu_ratio": round(neu_ratio, 4),
+            "influencer_mentions": a["influencer_mentions"],
+            "post_mentions": a["post_mentions"],
+            "comment_mentions": a["comment_mentions"],
+            "score_sum": a["score_sum"],
+            "lookback_hours": LOOKBACK_HOURS,
+            "subreddits": ",".join(SUBREDDITS)
+        })
+
+    df = pd.DataFrame(rows).sort_values(["mentions","avg_compound"], ascending=[False, False])
+
+    # Upsert/append to Sentiment
+    sentiment_header = [
+        "date","timestamp","source","ticker","mentions","avg_compound",
+        "pos_ratio","neg_ratio","neu_ratio",
+        "influencer_mentions","post_mentions","comment_mentions",
+        "score_sum","lookback_hours","subreddits"
+    ]
+    ws = ensure_ws(ss, SENTIMENT_SHEET_NAME, sentiment_header)
+    if not df.empty:
+        ws.append_rows([[row.get(h, "") for h in sentiment_header] for _, row in df.iterrows()],
+                       value_input_option="USER_ENTERED")
+
+    # Materialize a quick Top sheet (today only)
+    top_header = ["timestamp","ticker","mentions","avg_compound","pos_ratio","neg_ratio","influencer_mentions"]
+    top_ws = ensure_ws(ss, "Sentiment_Top", top_header)
+    today = df[df["date"] == run_date].copy()
+    top_df = today.sort_values(["mentions","avg_compound"], ascending=[False, False]).head(25)
+    try:
+        top_ws.clear()
+    except Exception:
+        pass
+    top_ws.append_row(top_header)
+    if not top_df.empty:
+        top_ws.append_rows(top_df[["timestamp","ticker","mentions","avg_compound","pos_ratio","neg_ratio","influencer_mentions"]].values.tolist())
+
+    print(f"[DONE] Wrote {len(df)} ticker rows to '{SENTIMENT_SHEET_NAME}'.")
+    if not top_df.empty:
+        print(f"[DONE] Wrote Top {len(top_df)} to 'Sentiment_Top'.")
+    else:
+        print("[INFO] No top rows for today.")
+
+if __name__ == "__main__":
+    main()
