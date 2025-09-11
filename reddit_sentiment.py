@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 """
-Reddit Sentiment Ingestion (independent layer for Tableau/Streamlit)
+Reddit Sentiment Ingestion (robust + idempotent)
 
-- Pulls posts & comments from target subreddits for the last N hours
-- Extracts watchlist tickers (from Google Sheet tab "Watchlist" col A)
-- Scores text using VADER (+ WSB slang lexicon)
-- Weights by upvotes/comments + influencer usernames (e.g., RoaringKitty/DeepFuckingValue)
-- Appends/upserts results into Google Sheet tab "Sentiment"
+Fixes:
+- If a sheet already exists, don't crash; just fetch it and continue.
+- If 'Watchlist' is missing, create it with a 'Ticker' header.
+- Header bootstrap for empty sheets.
 
-Environment variables (secrets):
+ENV VARS (required):
   REDDIT_CLIENT_ID
   REDDIT_CLIENT_SECRET
-  REDDIT_USER_AGENT            e.g., "AriesSentimentBot/0.1 by u/<yourname>"
-  GOOGLE_SHEETS_JSON           (full JSON of a Google Service Account key)
-  GOOGLE_SHEET_ID              (target Google Sheet ID)
-Optional env:
-  SUBREDDITS                   default: "wallstreetbets,stocks,investing"
-  LOOKBACK_HOURS               default: "24"
-  MAX_POSTS_PER_SUBREDDIT      default: "300"
-  MAX_COMMENTS_PER_POST        default: "200"
-  MIN_POST_SCORE               default: "1"
-  INFLUENCERS                  default: "DeepFuckingValue,RoaringKitty"
-  SENTIMENT_SHEET_NAME         default: "Sentiment"
-  WATCHLIST_SHEET_NAME         default: "Watchlist"
+  REDDIT_USER_AGENT
+  GOOGLE_SHEETS_JSON
+  GOOGLE_SHEET_ID
+
+Optional:
+  SUBREDDITS (default: "wallstreetbets,stocks,investing")
+  LOOKBACK_HOURS (default: "24")
+  MAX_POSTS_PER_SUBREDDIT (default: "300")
+  MAX_COMMENTS_PER_POST (default: "200")
+  MIN_POST_SCORE (default: "1")
+  INFLUENCERS (default: "DeepFuckingValue,RoaringKitty")
+  SENTIMENT_SHEET_NAME (default: "Sentiment")
+  WATCHLIST_SHEET_NAME (default: "Watchlist")
 """
 
 import os, json, math, time, re, sys
@@ -33,6 +33,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import praw
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from gspread.exceptions import WorksheetNotFound, APIError
 
 # ---------- ENV & CONFIG ----------
 SUBREDDITS = [s.strip() for s in os.getenv("SUBREDDITS", "wallstreetbets,stocks,investing").split(",") if s.strip()]
@@ -44,54 +45,88 @@ INFLUENCERS = set(u.strip().lower() for u in os.getenv("INFLUENCERS", "DeepFucki
 SENTIMENT_SHEET_NAME = os.getenv("SENTIMENT_SHEET_NAME", "Sentiment")
 WATCHLIST_SHEET_NAME = os.getenv("WATCHLIST_SHEET_NAME", "Watchlist")
 
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
-GOOGLE_SHEETS_JSON = os.getenv("GOOGLE_SHEETS_JSON")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-
-REQUIRED_ENV = ["REDDIT_CLIENT_ID","REDDIT_CLIENT_SECRET","REDDIT_USER_AGENT","GOOGLE_SHEETS_JSON","GOOGLE_SHEET_ID"]
+REQUIRED_ENV = [
+    "REDDIT_CLIENT_ID",
+    "REDDIT_CLIENT_SECRET",
+    "REDDIT_USER_AGENT",
+    "GOOGLE_SHEETS_JSON",
+    "GOOGLE_SHEET_ID",
+]
 missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
 if missing:
     sys.exit(f"Missing required env vars: {', '.join(missing)}")
 
-# ---------- UTILS ----------
+# ---------- SHEETS AUTH ----------
 def auth_sheets():
-    info = json.loads(GOOGLE_SHEETS_JSON)
+    info = json.loads(os.getenv("GOOGLE_SHEETS_JSON"))
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(GOOGLE_SHEET_ID)
+    return gc.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
 
 def ensure_worksheet(ss, title, header):
+    """
+    Idempotent worksheet getter/creator:
+    - Try to fetch
+    - If not found, try to create
+    - If API says 'already exists', fetch again
+    - Ensure header exists if sheet is empty
+    """
     try:
         ws = ss.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = ss.add_worksheet(title=title, rows=1000, cols=len(header))
-        ws.append_row(header)
-    # If empty, add header
-    if len(ws.get_all_values()) == 0:
-        ws.append_row(header)
+    except WorksheetNotFound:
+        try:
+            ws = ss.add_worksheet(title=title, rows=1000, cols=max(26, len(header)))
+        except APIError as e:
+            # If another run created it moments ago or it already existed, fetch it
+            if "already exists" in str(e).lower():
+                ws = ss.worksheet(title)
+            else:
+                raise
+
+    # Ensure header row
+    values = ws.get_all_values()
+    if not values:
+        if header:
+            ws.append_row(header)
+    else:
+        # If a header is present but doesn't match length, we don't mutate; we just proceed.
+        pass
+    return ws
+
+def ensure_watchlist_sheet(ss):
+    """
+    Guarantee a Watchlist sheet with a 'Ticker' header exists.
+    """
+    wl_header = ["Ticker"]
+    ws = ensure_worksheet(ss, WATCHLIST_SHEET_NAME, wl_header)
+    # If empty besides header, fine. If user has entries, they'll be in col A.
     return ws
 
 def read_watchlist(ss):
-    try:
-        ws = ss.worksheet(WATCHLIST_SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"[WARN] Watchlist sheet '{WATCHLIST_SHEET_NAME}' not found. Falling back to empty watchlist.")
-        return set()
-    vals = ws.col_values(1)
-    # drop header + clean
+    ws = ensure_watchlist_sheet(ss)
+    vals = ws.col_values(1)  # Column A
     tickers = set()
-    for v in vals[1:] if vals and vals[0].strip().lower() in ("ticker","tickers","symbol","symbols") else vals:
+    # Drop header if present
+    start_idx = 1 if vals and vals[0].strip().lower() in ("ticker", "tickers", "symbol", "symbols") else 0
+    for v in vals[start_idx:]:
         sym = (v or "").strip().upper()
         if sym and 1 <= len(sym) <= 5 and sym.isalpha():
             tickers.add(sym)
     return tickers
 
+# ---------- REDDIT AUTH ----------
+def auth_reddit():
+    return praw.Reddit(
+        client_id=os.getenv("REDDIT_CLIENT_ID"),
+        client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
+        user_agent=os.getenv("REDDIT_USER_AGENT"),
+        ratelimit_seconds=5,
+    )
+
+# ---------- NLP ----------
 def make_vader():
     an = SentimentIntensityAnalyzer()
-    # Augment lexicon for finance/WSB slang
     tweaks = {
         "bullish": 2.3, "bearish": -2.3,
         "to the moon": 2.5, "🚀": 2.4, "rocket": 1.5,
@@ -100,25 +135,23 @@ def make_vader():
         "rug pull": -2.4, "yolo": 0.5, "tendies": 1.8,
         "squeeze": 1.2, "short squeeze": 2.2, "gamma squeeze": 2.0
     }
-    for k,v in tweaks.items():
+    for k, v in tweaks.items():
         an.lexicon[k] = v
     return an
 
 TICKER_CASHTAG_RE = re.compile(r'\$([A-Z]{1,5})\b')
-# Fallback: match plain words only if in watchlist to avoid FP like "A", "AI", "CEO"
 def extract_mentions(text, watchlist):
-    found = set()
-    for m in TICKER_CASHTAG_RE.findall(text):
-        found.add(m)
-    # plain words (upper) that are in watchlist
-    tokens = re.findall(r'\b[A-Z]{1,5}\b', text)
-    for t in tokens:
+    found = set(TICKER_CASHTAG_RE.findall(text))
+    for t in re.findall(r'\b[A-Z]{1,5}\b', text):
         if t in watchlist:
             found.add(t)
     return found
 
+def analyze_text(analyzer, text: str):
+    s = analyzer.polarity_scores(text)
+    return {"pos": s["pos"], "neu": s["neu"], "neg": s["neg"], "compound": s["compound"]}
+
 def weight_from_post_score(score: int, num_comments: int, awards: int) -> float:
-    # Upvote/comment/award signal; soft-bounded
     w = 1.0 + math.log10(1 + max(0, score)) + 0.2 * math.log10(1 + max(0, num_comments))
     if awards and awards > 0:
         w += 0.3
@@ -129,28 +162,12 @@ def weight_from_comment_score(score: int) -> float:
     return max(0.5, min(w, 3.0))
 
 def influence_bonus(author: str) -> float:
-    if not author:
-        return 0.0
-    return 1.5 if author.lower() in INFLUENCERS else 0.0
+    return 1.5 if (author and author.lower() in INFLUENCERS) else 0.0
 
-def analyze_text(analyzer, text: str) -> dict:
-    s = analyzer.polarity_scores(text)
-    return {"pos": s["pos"], "neu": s["neu"], "neg": s["neg"], "compound": s["compound"]}
-
-# ---------- REDDIT SCRAPE ----------
-def auth_reddit():
-    return praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
-        ratelimit_seconds=5,
-    )
-
+# ---------- FETCH ----------
 def fetch_recent_items(r, subreddits, cutoff_utc):
-    """Yield dicts for posts and comments (limited) newer than cutoff."""
     for sub in subreddits:
         subreddit = r.subreddit(sub)
-        # Use 'new' to bias for time window; also scan 'hot' lightly for high-signal content
         streams = [("new", MAX_POSTS_PER_SUB), ("hot", max(50, MAX_POSTS_PER_SUB // 5))]
         for kind, limit in streams:
             try:
@@ -164,6 +181,7 @@ def fetch_recent_items(r, subreddits, cutoff_utc):
                     continue
                 if getattr(post, "score", 0) < MIN_POST_SCORE:
                     continue
+
                 yield {
                     "type": "post",
                     "subreddit": sub,
@@ -177,8 +195,7 @@ def fetch_recent_items(r, subreddits, cutoff_utc):
                     "permalink": f"https://www.reddit.com{post.permalink}",
                 }
 
-                # fetch top-level comments (limited)
-                post_comments = []
+                # Comments (limited)
                 try:
                     post.comments.replace_more(limit=0)
                     for i, c in enumerate(post.comments.list()):
@@ -186,7 +203,7 @@ def fetch_recent_items(r, subreddits, cutoff_utc):
                             break
                         if getattr(c, "created_utc", 0) < cutoff_utc:
                             continue
-                        post_comments.append({
+                        yield {
                             "type": "comment",
                             "subreddit": sub,
                             "id": c.id,
@@ -196,36 +213,27 @@ def fetch_recent_items(r, subreddits, cutoff_utc):
                             "parent_id": c.parent_id,
                             "link_id": c.link_id,
                             "permalink": f"https://www.reddit.com{c.permalink}",
-                        })
+                        }
                 except Exception as e:
                     print(f"[WARN] Comments fetch failed for {post.id}: {e}")
 
-                for c in post_comments:
-                    yield c
+                time.sleep(0.2)  # be nice to the API
 
-                # be nice to the API
-                time.sleep(0.2)
-
-# ---------- PIPELINE ----------
+# ---------- MAIN ----------
 def main():
     # Auth
     ss = auth_sheets()
     analyzer = make_vader()
     r = auth_reddit()
 
-    # Watchlist
+    # Watchlist (guaranteed to exist)
     watchlist = read_watchlist(ss)
-    if not watchlist:
-        print("[WARN] Watchlist empty—pipeline will only capture $CASHTAG mentions.")
 
-    # Cutoff
+    # Time window
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     cutoff_utc = cutoff_dt.timestamp()
 
-    # Aggregate
-    rows = []
-    per_ticker = {}  # ticker -> stats
-
+    per_ticker = {}
     for item in fetch_recent_items(r, SUBREDDITS, cutoff_utc):
         if item["type"] == "post":
             text = f"{item['title']} {item['selftext']}".strip()
@@ -234,7 +242,6 @@ def main():
                 continue
             s = analyze_text(analyzer, text)
             w = weight_from_post_score(item["score"], item["num_comments"], item["awards"]) + influence_bonus(item["author"])
-
             for tk in mentions:
                 agg = per_ticker.setdefault(tk, {
                     "mentions": 0, "weighted_compound_sum": 0.0, "weight_sum": 0.0,
@@ -260,7 +267,6 @@ def main():
                 continue
             s = analyze_text(analyzer, text)
             w = weight_from_comment_score(item["score"]) + influence_bonus(item["author"])
-
             for tk in mentions:
                 agg = per_ticker.setdefault(tk, {
                     "mentions": 0, "weighted_compound_sum": 0.0, "weight_sum": 0.0,
@@ -281,10 +287,12 @@ def main():
         print("[INFO] No mentions found in the lookback window.")
         return
 
-    # Build rows
-    run_dt = datetime.now(timezone.utc).astimezone()  # local tz on runner
+    # Build dataframe
+    run_dt = datetime.now(timezone.utc).astimezone()
     run_date = run_dt.date().isoformat()
     run_ts = run_dt.isoformat(timespec="seconds")
+
+    rows = []
     for tk, a in per_ticker.items():
         avg_compound = a["weighted_compound_sum"] / a["weight_sum"] if a["weight_sum"] > 0 else 0.0
         pos_ratio = a["pos_sum"] / a["weight_sum"] if a["weight_sum"] > 0 else 0.0
@@ -293,74 +301,4 @@ def main():
 
         rows.append({
             "date": run_date,
-            "timestamp": run_ts,
-            "source": "reddit",
-            "ticker": tk,
-            "mentions": a["mentions"],
-            "avg_compound": round(avg_compound, 4),
-            "pos_ratio": round(pos_ratio, 4),
-            "neg_ratio": round(neg_ratio, 4),
-            "neu_ratio": round(neu_ratio, 4),
-            "influencer_mentions": a["influencer_mentions"],
-            "post_mentions": a["post_mentions"],
-            "comment_mentions": a["comment_mentions"],
-            "score_sum": a["score_sum"],
-            "lookback_hours": LOOKBACK_HOURS,
-            "subreddits": ",".join(SUBREDDITS)
-        })
-
-    df = pd.DataFrame(rows).sort_values(["mentions","avg_compound"], ascending=[False, False])
-
-    # Upsert to sheet
-    sentiment_header = [
-        "date","timestamp","source","ticker","mentions","avg_compound",
-        "pos_ratio","neg_ratio","neu_ratio",
-        "influencer_mentions","post_mentions","comment_mentions",
-        "score_sum","lookback_hours","subreddits"
-    ]
-    ws = ensure_worksheet(ss, SENTIMENT_SHEET_NAME, sentiment_header)
-
-    # Index existing (date,ticker) to avoid duplicates for same day
-    existing = ws.get_all_values()
-    idx = {}
-    if existing and len(existing) > 1:
-        hdr = existing[0]
-        colmap = {h:i for i,h in enumerate(hdr)}
-        for r in existing[1:]:
-            try:
-                k = (r[colmap["date"]], r[colmap["ticker"]])
-                idx[k] = True
-            except Exception:
-                continue
-
-    # Append or update (simple strategy: append; let Tableau use latest timestamp)
-    # If you prefer hard upsert, implement cell updates by locating row index.
-    append_values = []
-    for _, row in df.iterrows():
-        append_values.append([row.get(h,"") for h in sentiment_header])
-
-    if append_values:
-        ws.append_rows(append_values, value_input_option="USER_ENTERED")
-
-    # Optional: materialize a quick Top sheet (today only)
-    top_title = "Sentiment_Top"
-    top_ws = ensure_worksheet(ss, top_title, ["timestamp","ticker","mentions","avg_compound","pos_ratio","neg_ratio","influencer_mentions"])
-    today = df[df["date"] == run_date].copy()
-    top_df = today.sort_values(["mentions","avg_compound"], ascending=[False, False]).head(25)
-    # Clear & rewrite
-    try:
-        top_ws.clear()
-    except Exception:
-        pass
-    top_ws.append_row(["timestamp","ticker","mentions","avg_compound","pos_ratio","neg_ratio","influencer_mentions"])
-    if len(top_df):
-        top_ws.append_rows(top_df[["timestamp","ticker","mentions","avg_compound","pos_ratio","neg_ratio","influencer_mentions"]].values.tolist())
-
-    print(f"[DONE] Wrote {len(df)} ticker rows to '{SENTIMENT_SHEET_NAME}'.")
-    if len(top_df):
-        print(f"[DONE] Wrote Top {len(top_df)} to '{top_title}'.")
-    else:
-        print("[INFO] No top rows for today.")
-
-if __name__ == "__main__":
-    main()
+            "timestamp": run_t_
