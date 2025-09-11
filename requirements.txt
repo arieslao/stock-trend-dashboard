@@ -9,6 +9,7 @@ joblib==1.4.2
 #yfinance==0.2.44
 oauth2client
 python-dotenv==1.0.1
+altair
 
 # Google Sheets
 pydrive2==1.21.3
