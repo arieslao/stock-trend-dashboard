@@ -46,9 +46,9 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ---------- ENV & CONFIG ----------
 SUBREDDITS = [s.strip() for s in os.getenv("SUBREDDITS", "wallstreetbets,stocks,investing").split(",") if s.strip()]
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
-MAX_POSTS_PER_SUB = int(os.getenv("MAX_POSTS_PER_SUBREDDIT", "300"))
-MAX_COMMENTS_PER_POST = int(os.getenv("MAX_COMMENTS_PER_POST", "200"))
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "168"))
+MAX_POSTS_PER_SUB = int(os.getenv("MAX_POSTS_PER_SUBREDDIT", "30000"))
+MAX_COMMENTS_PER_POST = int(os.getenv("MAX_COMMENTS_PER_POST", "20000"))
 MIN_POST_SCORE = int(os.getenv("MIN_POST_SCORE", "1"))
 INFLUENCERS = {u.strip().lower() for u in os.getenv("INFLUENCERS", "DeepFuckingValue,RoaringKitty").split(",") if u.strip()}
 SENTIMENT_SHEET_NAME = os.getenv("SENTIMENT_SHEET_NAME", "Sentiment")
