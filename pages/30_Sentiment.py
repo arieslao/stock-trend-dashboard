@@ -13,18 +13,40 @@ st.set_page_config(page_title="Sentiment Overview", page_icon="💬", layout="wi
 # ---------- Google Sheets helpers ----------
 @st.cache_resource(show_spinner=False)
 def _gs_client():
-    # Build creds from secrets.toml
-    info = dict(st.secrets["gsheets"])
-    # Pop non-credential keys
-    sheet_id = info.pop("sheet_id")
-    sentiment_tab = info.pop("sentiment_tab", "Sentiment")
-    sentiment_top_tab = info.pop("sentiment_top_tab", "Sentiment_Top")
-    watchlist_tab = info.pop("watchlist_tab", "Watchlist")
+    cfg = st.secrets["gsheets"]  # must exist as a section
+
+    # Required: sheet_id & tab names
+    sheet_id = cfg.get("sheet_id")
+    sentiment_tab = cfg.get("sentiment_tab", "Sentiment")
+    sentiment_top_tab = cfg.get("sentiment_top_tab", "Sentiment_Top")
+    watchlist_tab = cfg.get("watchlist_tab", "Watchlist")
+
+    # Service account can be provided either as:
+    #  A) full fields inside [gsheets] (type, project_id, private_key, …)
+    #  B) a single JSON string under key "service_account"
+    if "service_account" in cfg:
+        import json
+        info = json.loads(cfg["service_account"])
+    else:
+        # Build dict from flat keys in [gsheets]
+        info = {
+            "type": cfg["type"],
+            "project_id": cfg["project_id"],
+            "private_key_id": cfg["private_key_id"],
+            "private_key": cfg["private_key"],
+            "client_email": cfg["client_email"],
+            "client_id": cfg["client_id"],
+            "token_uri": cfg.get("token_uri", "https://oauth2.googleapis.com/token"),
+        }
+
+    from google.oauth2.service_account import Credentials
+    import gspread
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     gc = gspread.authorize(creds)
     ss = gc.open_by_key(sheet_id)
     return ss, sentiment_tab, sentiment_top_tab, watchlist_tab
+
 
 def _ws_by_title(ss, title: str):
     # Case-insensitive lookup to be forgiving
