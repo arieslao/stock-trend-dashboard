@@ -24,7 +24,7 @@ h5py>=3.8                # Keras sometimes needs this for model I/O
 #pandas-ta
 
 #Vader (Valence Aware Dictionary for Sentiment Reasoning) Model
-praw==7.7.1
+praw==7.8.1
 vaderSentiment==3.3.2
 
 # Timezone data for zoneinfo on some platforms
