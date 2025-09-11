@@ -8,6 +8,7 @@ requests==2.32.3
 joblib==1.4.2
 #yfinance==0.2.44
 oauth2client
+python-dotenv==1.0.1
 
 # Google Sheets
 pydrive2==1.21.3
@@ -21,6 +22,10 @@ tensorflow-cpu==2.15.0
 protobuf<4.25.0          # avoids known TF/Protobuf import clash
 h5py>=3.8                # Keras sometimes needs this for model I/O
 #pandas-ta
+
+#Vader (Valence Aware Dictionary for Sentiment Reasoning) Model
+praw==7.7.1
+vaderSentiment==3.3.2
 
 # Timezone data for zoneinfo on some platforms
 tzdata>=2023.3
