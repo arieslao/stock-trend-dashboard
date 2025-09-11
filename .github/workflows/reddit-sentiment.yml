@@ -1,0 +1,45 @@
+name: Reddit Sentiment (Independent Layer)
+
+on:
+  schedule:
+    # Every 2 hours; adjust as you like
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Reddit Sentiment
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          GOOGLE_SHEETS_JSON: ${{ secrets.GOOGLE_SHEETS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # Optional tunables:
+          SUBREDDITS: "wallstreetbets,stocks,investing"
+          LOOKBACK_HOURS: "4"
+          MAX_POSTS_PER_SUBREDDIT: "300"
+          MAX_COMMENTS_PER_POST: "200"
+          MIN_POST_SCORE: "1"
+          INFLUENCERS: "DeepFuckingValue,RoaringKitty"
+          SENTIMENT_SHEET_NAME: "Sentiment"
+          WATCHLIST_SHEET_NAME: "Watchlist"
+        run: |
+          python reddit_sentiment.py
